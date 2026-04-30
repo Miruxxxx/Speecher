@@ -1,0 +1,30 @@
+# started 2025-12-17T16:56:02
+by something's broken when nothing looks broken. Think of coding like being a detective.
+The syntax, that's just your notebook, but The real magic is in asking the right questions, tracing clues and piecing things together.
+Early on, I'd freeze every time something didn't work like it's broken I must suck But eventually I realized, debugging is the
+job. It's not the failure, it's the process. The devs you admire aren't just fluent in a language.
+They are relentless problem solvers They stay curious, they ask questions, they keep digging.
+If you want to level up fast start focusing less lesson what to write and more on why it's written that way.
+Build your thinking muscle and not just your typing speed.
+By the way, check the description below for my beginner dev video series because I'm sure you will find value into it.
+Nobody cares about your code, They care about what it does.
+This one might hurt a little, but you need to hear it. Nobody cares about your code.
+Not your client, not your boss, not the user, they care about what it does.
+You could write the cleanest, most elegant code known to humankind, but if the button doesn't work or the side loads like
+it's on dial-up, It's useless. I remember building this beautifully abstracted component once.
+I was so proud of it, it was reusable, efficient, do not repeat yourself but the client they just said cool can
+we make the button blue Instead of green, they didn't care, they just didn't care about my clever hooks, they just wanted
+results. Think of your coat like plumbing. Somebody looks under the sink and clubs because your pipes are tidy.
+they just want the water to run. Write code that works. Write code that solves problems.
+If it's clean and elegant too, great. But don't lose sleep over the perfect solution, No one sees.
+Value is better than vanity. Where now is real, protect your energy. Let's get real for a second.
+Where now is real, and it can hit hard.
+You start of excited, motivated, watching tutorials at double speed, drinking way too much coffee, fast forward a few months later, you're
+exhausted, confused and wondering if you're even meant for coding. Been there.
+I once spent an entire can't try to fix one tiny bug.
+Did I need properly, barely slept, just stared at the screen hoping the code would magically heal itself.
+When I finally solved it, sure, the back was gone, but so was my energy.
+And Honestly, that wasn't a win, That was a warning. This idea that real developers grind 24-7 total nonsense.
+The best developers I know, the ones who Last, they take breaks. They have boundaries. They rest. They go on holidays.
+they play games. Think of your brain like a battery. You wouldn't run your phone at 1% of the day.
+# stopped 2025-12-17T16:59:13
