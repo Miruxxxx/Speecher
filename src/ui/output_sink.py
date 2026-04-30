@@ -3,15 +3,12 @@ from __future__ import annotations
 import queue
 import sys
 import threading
-import time
-from typing import Optional
+from typing import List, Optional
 
-from asr.events import ASREvent
-from transcript_engine import TranscriptEngine, TranscriptUpdate
-from utils.latency import LatencyTracker
+from asr.events import ASREvent, Word
 
 
-class ANSI:
+class _ANSI:
     CLEAR_LINE = "\033[2K"
     COL0 = "\r"
     GREEN = "\033[32m"
@@ -26,142 +23,84 @@ def _isatty() -> bool:
 
 class OutputSink:
     """
-    OutputSink coordinates ASR events, transcript stabilization, and rendering.
+    Consumes ASREvents and writes to stdout.
+
+    Committed events are printed once and never rewritten. Partials are
+    drawn on a single live line that gets cleared and redrawn each time.
+    The engine is the single source of truth for what is committed: this
+    sink does no merging, no overlap detection, no stabilization.
     """
 
     def __init__(
         self,
         *,
-        events: queue.Queue[ASREvent],
+        events: "queue.Queue[ASREvent]",
         stop_event: threading.Event,
-        latency: Optional[LatencyTracker] = None,
-        final_stability_n: int = 2,
-        final_stability_ratio: float = 0.82,
-        final_stability_window_words: int = 40,
-        min_final_overlap_words: int = 3,
-        fuzzy_overlap_min_ratio: float = 0.78,
-        max_backtrack_words: int = 48,
-        tail_anchor_words: int = 140,
         live_indicator: str = "⚡",
         enable_colors: bool = True,
-        idle_finalize_sec: float = 0.8,
+        verbose_logs: bool = False,
     ) -> None:
         self._events = events
         self._stop_event = stop_event
-        self._latency = latency
+        self._live_indicator = live_indicator
+        self._verbose_logs = verbose_logs
 
         self._interactive = _isatty()
         self._use_color = enable_colors and self._interactive
-        self._live_indicator = live_indicator
-        self._idle_finalize_sec = max(0.0, float(idle_finalize_sec))
-
-        self._engine = TranscriptEngine(
-            max_overlap_words=max(10, int(tail_anchor_words)),
-            final_stability_n=final_stability_n,
-            final_stability_ratio=final_stability_ratio,
-            final_stability_window_words=final_stability_window_words,
-            min_final_overlap_words=min_final_overlap_words,
-            fuzzy_overlap_min_ratio=fuzzy_overlap_min_ratio,
-            max_backtrack_words=max_backtrack_words,
-            tail_anchor_words=tail_anchor_words,
-        )
-
-        self._printed_committed_words = 0
         self._live_active = False
 
+    # ------------------------------------------------------------------
+
     def run(self) -> None:
-        last_ev_ts = time.monotonic()
         try:
             while not self._stop_event.is_set():
                 try:
-                    ev = self._events.get(timeout=0.05)
+                    ev = self._events.get(timeout=0.1)
                 except queue.Empty:
-                    last_ev_ts = self._maybe_idle_finalize(now=time.monotonic(), last_ev_ts=last_ev_ts)
                     continue
-
-                t0 = time.perf_counter()
-                upd = self._engine.update(ev)
-                self._render(upd)
-                last_ev_ts = time.monotonic()
-
-                if self._latency is not None:
-                    self._latency.mark("output", time.perf_counter() - t0)
-
+                self._dispatch(ev)
                 self._events.task_done()
-
         finally:
             self._clear_live()
-            self._flush_all()
 
-    def _render(self, upd: TranscriptUpdate) -> None:
-        if upd.commit_happened:
-            self._flush_committed(upd)
+    def _dispatch(self, ev: ASREvent) -> None:
+        if ev.type == "commit":
+            self._render_commit(ev.words)
+        elif ev.type == "partial":
+            self._render_partial(ev.words)
+        elif ev.type == "log":
+            if self._verbose_logs:
+                self._print_log(f"[{ev.source}] {ev.text}")
+        elif ev.type == "fatal":
+            self._print_log(f"[FATAL {ev.source}] {ev.text}")
 
-        self._render_live(upd)
+    # -- rendering ------------------------------------------------------
 
-    def _flush_committed(self, upd: TranscriptUpdate) -> None:
-        pieces = upd.committed_pieces
-        start = upd.committed_prev_len
-        end = len(pieces)
-
-        if start < self._printed_committed_words:
-            self._printed_committed_words = start
-
-        if start >= end:
-            self._printed_committed_words = end
-            return
-
-        self._clear_live()
-        text = "".join(pieces[start:end]).strip()
+    def _render_commit(self, words: List[Word]) -> None:
+        text = " ".join(w.text for w in words if w.text).strip()
         if not text:
-            self._printed_committed_words = end
             return
-
+        self._clear_live()
         if self._use_color:
-            print(f"{ANSI.GREEN}{text}{ANSI.RESET}", flush=True)
+            print(f"{_ANSI.GREEN}{text}{_ANSI.RESET}", flush=True)
         else:
             print(text, flush=True)
 
-        self._printed_committed_words = end
-
-    def _flush_all(self) -> None:
-        upd = self._engine.finalize()
-        self._flush_committed(upd)
-        self._clear_live()
-
-    def _maybe_idle_finalize(self, *, now: float, last_ev_ts: float) -> float:
-        if self._idle_finalize_sec <= 0:
-            return last_ev_ts
-        if (now - last_ev_ts) < self._idle_finalize_sec:
-            return last_ev_ts
-
-        upd = self._engine.finalize()
-        self._flush_committed(upd)
-        self._clear_live()
-        return now
-
-    def _render_live(self, upd: TranscriptUpdate) -> None:
+    def _render_partial(self, words: List[Word]) -> None:
         if not self._interactive:
             return
-
-        base_pieces = upd.committed_pieces
-
-        live_tail = "".join(upd.partial_pieces[upd.partial_skip:]).strip()
-        base_tail = "".join(base_pieces[self._printed_committed_words:]).strip()
-
-        if not base_tail and not live_tail:
+        text = " ".join(w.text for w in words if w.text).strip()
+        if not text:
             self._clear_live()
             return
 
-        line = " ".join(x for x in (base_tail, live_tail) if x)
-
         prefix = f"{self._live_indicator} "
         if self._use_color:
-            out = f"{ANSI.DIM}{prefix}{ANSI.YELLOW}{line}{ANSI.RESET}"
+            line = f"{_ANSI.DIM}{prefix}{_ANSI.YELLOW}{text}{_ANSI.RESET}"
         else:
-            out = prefix + line
+            line = prefix + text
 
-        sys.stdout.write(ANSI.CLEAR_LINE + ANSI.COL0 + out)
+        sys.stdout.write(_ANSI.CLEAR_LINE + _ANSI.COL0 + line)
         sys.stdout.flush()
         self._live_active = True
 
@@ -169,6 +108,11 @@ class OutputSink:
         if not self._live_active:
             return
         if self._interactive:
-            sys.stdout.write(ANSI.CLEAR_LINE + ANSI.COL0)
+            sys.stdout.write(_ANSI.CLEAR_LINE + _ANSI.COL0)
             sys.stdout.flush()
         self._live_active = False
+
+    def _print_log(self, msg: str) -> None:
+        self._clear_live()
+        sys.stderr.write(msg + "\n")
+        sys.stderr.flush()

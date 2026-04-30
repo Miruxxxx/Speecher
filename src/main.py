@@ -6,94 +6,77 @@ import threading
 from faster_whisper import WhisperModel
 
 from asr.events import ASREvent
-from asr.streaming_worker import FastASRWorker, RefinerASRWorker
-from audio.buffer import RingBuffer
+from asr.streaming_engine import StreamingASREngine
+from asr.whisper_adapter import WhisperAdapter
+from audio.buffer import GrowingAudioBuffer
 from audio.capture_stream import LoopbackStreamCapture
 from ui.output_sink import OutputSink
 from utils.latency import LatencyTracker
+
 
 TARGET_SR = 16000
 
 
 def main() -> None:
     stop_event = threading.Event()
-    events: queue.Queue[ASREvent] = queue.Queue(maxsize=200)
-    latency = LatencyTracker(window=120)
+    events: "queue.Queue[ASREvent]" = queue.Queue(maxsize=400)
+    latency = LatencyTracker(window=120, keys=("capture_convert", "whisper"))
 
-    output_sink = OutputSink(
-        events=events,
-        stop_event=stop_event,
-        latency=latency,
-        final_stability_n=2,
-        final_stability_ratio=0.82,
-        final_stability_window_words=40,
-        min_final_overlap_words=3,
-        fuzzy_overlap_min_ratio=0.78,
-        max_backtrack_words=48,
-        tail_anchor_words=140,
-        live_indicator="⚡",
-        enable_colors=True,
-    )
-
-    output_thread = threading.Thread(
-        target=output_sink.run,
-        name="output_sink",
-        daemon=True,
-    )
-    output_thread.start()
-
-    ring = RingBuffer(max_seconds=12, sample_rate=TARGET_SR)
+    audio_buffer = GrowingAudioBuffer(sample_rate=TARGET_SR, max_seconds=60.0)
 
     capture = LoopbackStreamCapture(
-        ring_buffer=ring,
+        audio_buffer=audio_buffer,
         name_hint="HyperX",
         target_sr=TARGET_SR,
-        latency=latency,
         events=events,
         stop_event=stop_event,
+        latency=latency,
     )
+
+    model = WhisperModel("base", device="cuda", compute_type="float16")
+    transcribe_fn = WhisperAdapter(
+        model,
+        language="en",  # autodetect; pass "en" / "ru" / etc. to lock it
+        vad_filter=True,
+        vad_parameters={"min_silence_duration_ms": 500},
+        beam_size=5,
+        condition_on_previous_text=False,
+    )
+
+    engine = StreamingASREngine(
+        audio_buffer=audio_buffer,
+        transcribe_fn=transcribe_fn,
+        events=events,
+        stop_event=stop_event,
+        chunk_interval_sec=1.0,
+        min_audio_sec=1.0,
+        commit_safety_margin_sec=0.1,
+        max_buffer_sec=25.0,
+        force_commit_keep_tail_words=6,
+        latency=latency,
+    )
+
+    sink = OutputSink(
+        events=events,
+        stop_event=stop_event,
+        verbose_logs=False,
+    )
+
+    sink_thread = threading.Thread(target=sink.run, name="output", daemon=True)
+    engine_thread = threading.Thread(target=engine.run, name="engine", daemon=True)
+
+    sink_thread.start()
     capture.start()
-
-    fast_model = WhisperModel("base", device="cuda", compute_type="float16")
-    refine_model = fast_model
-
-    fast_worker = FastASRWorker(
-        ring_buffer=ring,
-        model=fast_model,
-        events=events,
-        stop_event=stop_event,
-        input_sr=TARGET_SR,
-        target_sr=TARGET_SR,
-        window_sec=3.0,
-        step_sec=0.25,
-        latency=latency,
-        language="none",
-    )
-
-    refiner = RefinerASRWorker(
-        ring_buffer=ring,
-        model=refine_model,
-        events=events,
-        stop_event=stop_event,
-        input_sr=TARGET_SR,
-        target_sr=TARGET_SR,
-        window_sec=8.0,
-        every_sec=1.0,
-        latency=latency,
-        language="none",
-    )
-
-    threading.Thread(target=fast_worker.run, daemon=True).start()
-    threading.Thread(target=refiner.run, daemon=True).start()
+    engine_thread.start()
 
     try:
         input("Press Enter to stop...\n")
     finally:
         stop_event.set()
         capture.stop()
-        fast_worker.stop()
-        refiner.stop()
-        output_thread.join(timeout=2.0)
+        engine_thread.join(timeout=3.0)
+        sink_thread.join(timeout=2.0)
+        print(latency.report())
 
 
 if __name__ == "__main__":

@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+import queue
 import threading
 import time
+from typing import Optional
 
 import numpy as np
 import pyaudiowpatch as pyaudio
@@ -12,128 +14,126 @@ from .devices import pick_loopback_device
 
 
 class LoopbackStreamCapture:
+    """Capture system audio via WASAPI loopback into a GrowingAudioBuffer."""
+
     def __init__(
         self,
-        ring_buffer,
+        *,
+        audio_buffer,
         name_hint: str,
+        target_sr: int,
+        events: "queue.Queue[ASREvent]",
+        stop_event: threading.Event,
         frames_per_buffer: int = 2048,
         max_channels: int = 2,
-        target_sr: int | None = None,
-        latency=None,  # LatencyTracker (duck-typed)
-        events=None,  # queue.Queue[ASREvent] (duck-typed)
-        stop_event: threading.Event | None = None,
-    ):
-        self.ring_buffer = ring_buffer
-        self.name_hint = name_hint
-        self.frames_per_buffer = frames_per_buffer
-        self.max_channels = max_channels
-        self.target_sr = target_sr
-        self.latency = latency
-        self.events = events
-        self.app_stop_event = stop_event
+        latency=None,
+    ) -> None:
+        self._buffer = audio_buffer
+        self._name_hint = name_hint
+        self._target_sr = int(target_sr)
+        self._events = events
+        self._stop_event = stop_event
+        self._frames_per_buffer = int(frames_per_buffer)
+        self._max_channels = int(max_channels)
+        self._latency = latency
 
-        self._pa: pyaudio.PyAudio | None = None
+        self._pa: Optional[pyaudio.PyAudio] = None
         self._stream = None
-        self._thread: threading.Thread | None = None
-        self._stop_event = threading.Event()
+        self._thread: Optional[threading.Thread] = None
+        self._local_stop = threading.Event()
 
-        self._src_sr: int | None = None
-        self._channels: int | None = None
+    # -- lifecycle ------------------------------------------------------
 
     def start(self) -> None:
         if self._thread is not None:
             return
-        self._stop_event.clear()
+        self._local_stop.clear()
         self._thread = threading.Thread(target=self._run, name="capture", daemon=True)
         self._thread.start()
 
     def stop(self) -> None:
-        self._stop_event.set()
-        # Try to unblock a blocking `read()` quickly.
-        stream = self._stream
-        if stream is not None:
+        self._local_stop.set()
+        s = self._stream
+        if s is not None:
+            # Close the stream from the outside to unblock a hung read().
             try:
-                stream.stop_stream()
+                s.stop_stream()
             except Exception:
                 pass
             try:
-                stream.close()
+                s.close()
             except Exception:
                 pass
             self._stream = None
-
         t = self._thread
-        if t:
+        if t is not None:
             t.join(timeout=2.0)
-        # Cleanup is handled in the worker thread, but keep a safety net
-        # in case the thread got stuck and we force-closed the stream above.
-        if t and t.is_alive():
-            self._cleanup()
         self._thread = None
 
-    def _run(self) -> None:
-        self._emit_log("thread started")
-        self._pa = pyaudio.PyAudio()
+    # -- inner loop -----------------------------------------------------
 
+    def _run(self) -> None:
+        self._emit_log("capture started")
+        self._pa = pyaudio.PyAudio()
         try:
             try:
-                idx, name, ch, sr = pick_loopback_device(self._pa, self.name_hint)
-            except Exception as e:
-                self._emit_fatal(f"pick_loopback_device failed: {e!r}")
-                self._request_app_stop()
+                idx, name, ch, sr = pick_loopback_device(self._pa, self._name_hint)
+            except Exception as exc:
+                self._emit_fatal(f"pick_loopback_device failed: {exc!r}")
+                self._stop_event.set()
                 return
 
-            channels = max(1, min(int(ch), self.max_channels))
-            self._src_sr = int(sr)
-            self._channels = channels
-            self._emit_log(f"device='{name}' idx={idx} ch={channels} sr={sr}")
+            channels = max(1, min(int(ch), self._max_channels))
+            src_sr = int(sr)
+            self._emit_log(f"device='{name}' idx={idx} ch={channels} sr={src_sr}")
 
             try:
                 self._stream = self._pa.open(
                     format=pyaudio.paFloat32,
                     channels=channels,
-                    rate=sr,
+                    rate=src_sr,
                     input=True,
                     input_device_index=idx,
-                    frames_per_buffer=self.frames_per_buffer,
+                    frames_per_buffer=self._frames_per_buffer,
                 )
-            except Exception as e:
-                self._emit_fatal(f"stream open failed: {e!r}")
-                self._request_app_stop()
+            except Exception as exc:
+                self._emit_fatal(f"stream open failed: {exc!r}")
+                self._stop_event.set()
                 return
 
-            while not self._stop_event.is_set() and not self._is_app_stopping():
+            while not self._stopping():
                 try:
-                    data = self._stream.read(self.frames_per_buffer, exception_on_overflow=False)
-                except Exception as e:
-                    # If we are stopping, stream teardown can race with a blocking read().
-                    if self._stop_event.is_set() or self._is_app_stopping():
+                    raw = self._stream.read(self._frames_per_buffer, exception_on_overflow=False)
+                except Exception:
+                    if self._stopping():
                         break
                     raise
 
                 t0 = time.perf_counter()
-
-                audio = np.frombuffer(data, dtype=np.float32)
+                audio = np.frombuffer(raw, dtype=np.float32)
                 if channels > 1:
                     audio = audio.reshape(-1, channels).mean(axis=1)
+                if src_sr != self._target_sr:
+                    audio = resample_poly(audio, self._target_sr, src_sr).astype(np.float32, copy=False)
+                if self._latency is not None:
+                    self._latency.mark("capture_convert", time.perf_counter() - t0)
 
-                if self.target_sr and self._src_sr and self._src_sr != self.target_sr:
-                    audio = resample_poly(audio, self.target_sr, self._src_sr).astype(np.float32, copy=False)
+                self._buffer.write(audio)
 
-                if self.latency is not None:
-                    self.latency.mark("convert", time.perf_counter() - t0)
-
-                self.ring_buffer.write(audio)
-
-        except Exception as e:
-            self._emit_fatal(f"capture loop failed: {e!r}")
-            self._request_app_stop()
+        except Exception as exc:
+            self._emit_fatal(f"capture loop failed: {exc!r}")
+            self._stop_event.set()
         finally:
             self._cleanup()
-            self._emit_log("thread stopped")
+            self._emit_log("capture stopped")
+
+    # -- helpers --------------------------------------------------------
+
+    def _stopping(self) -> bool:
+        return self._local_stop.is_set() or self._stop_event.is_set()
 
     def _cleanup(self) -> None:
-        if self._stream:
+        if self._stream is not None:
             try:
                 self._stream.stop_stream()
             except Exception:
@@ -143,8 +143,7 @@ class LoopbackStreamCapture:
             except Exception:
                 pass
             self._stream = None
-
-        if self._pa:
+        if self._pa is not None:
             try:
                 self._pa.terminate()
             except Exception:
@@ -152,24 +151,13 @@ class LoopbackStreamCapture:
             self._pa = None
 
     def _emit_log(self, msg: str) -> None:
-        if self.events is None:
-            return
         try:
-            self.events.put_nowait(ASREvent(type="log", source="capture", text=str(msg)))
-        except Exception:
+            self._events.put_nowait(ASREvent(type="log", source="capture", text=str(msg)))
+        except queue.Full:
             pass
 
     def _emit_fatal(self, msg: str) -> None:
-        if self.events is None:
-            return
         try:
-            self.events.put_nowait(ASREvent(type="fatal", source="capture", text=str(msg)))
-        except Exception:
+            self._events.put(ASREvent(type="fatal", source="capture", text=str(msg)), timeout=0.5)
+        except queue.Full:
             pass
-
-    def _is_app_stopping(self) -> bool:
-        return bool(self.app_stop_event is not None and self.app_stop_event.is_set())
-
-    def _request_app_stop(self) -> None:
-        if self.app_stop_event is not None:
-            self.app_stop_event.set()

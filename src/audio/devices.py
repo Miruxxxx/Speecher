@@ -5,7 +5,7 @@ from typing import List, Tuple
 import pyaudiowpatch as pyaudio
 
 
-LoopbackDevice = Tuple[int, str, int, int]  # (index, name, max_input_channels, default_sample_rate)
+LoopbackDevice = Tuple[int, str, int, int]
 
 
 def list_loopbacks(pa: pyaudio.PyAudio) -> List[LoopbackDevice]:
@@ -32,10 +32,12 @@ def pick_loopback_device(pa: pyaudio.PyAudio, hint: str) -> LoopbackDevice:
     if not loopbacks:
         raise RuntimeError("No loopback devices found")
 
+    # Prefer devices that match the hint AND have input channels.
     for item in loopbacks:
         if hint_l and hint_l in item[1].lower() and item[2] > 0:
             return item
 
+    # Fall back to any name-match.
     for item in loopbacks:
         if hint_l and hint_l in item[1].lower():
             return item
