@@ -84,6 +84,8 @@ class Overlay(QWidget):
         self._poll_timer.timeout.connect(self._poll_events)
         self._poll_timer.start(50)
 
+        QTimer.singleShot(500, self._check_lm_availability)
+
     # ------------------------------------------------------------------
     # Window setup
     # ------------------------------------------------------------------
@@ -108,6 +110,15 @@ class Overlay(QWidget):
         root = QVBoxLayout(self)
         root.setContentsMargins(10, 8, 10, 6)
         root.setSpacing(5)
+
+        # LM Studio warning banner (hidden when server is available)
+        self._lm_warning = QLabel("⚠ LM Studio недоступен — запустите сервер на :1234")
+        self._lm_warning.setStyleSheet(
+            "QLabel { color: #ffaa33; background: rgba(80,50,0,160); "
+            "padding: 3px 8px; border-radius: 3px; font-size: 10px; }"
+        )
+        self._lm_warning.setVisible(False)
+        root.addWidget(self._lm_warning)
 
         # Title bar / drag handle
         title_row = QHBoxLayout()
@@ -203,6 +214,11 @@ class Overlay(QWidget):
 
     def mouseReleaseEvent(self, _ev) -> None:
         self._drag_pos = None
+
+    def closeEvent(self, event) -> None:
+        from PyQt6.QtWidgets import QApplication
+        QApplication.instance().quit()
+        event.accept()
 
     def keyPressEvent(self, ev) -> None:
         if ev.key() == Qt.Key.Key_Escape:
@@ -312,7 +328,15 @@ class Overlay(QWidget):
     # LLM interaction
     # ------------------------------------------------------------------
 
+    def _check_lm_availability(self) -> None:
+        self._lm_warning.setVisible(not self._llm.is_available())
+
     def _start_llm(self, prompt: str) -> None:
+        if not self._llm.is_available():
+            self._lm_warning.setVisible(True)
+            self._show_llm_output("[LM Studio недоступен — запустите сервер на :1234]")
+            return
+        self._lm_warning.setVisible(False)
         self._llm_busy = True
         self._set_buttons_enabled(False)
         self._show_llm_output("…")

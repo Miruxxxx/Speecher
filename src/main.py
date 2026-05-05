@@ -21,7 +21,6 @@ from utils.latency import LatencyTracker
 
 
 TARGET_SR = 16000
-LLM_MODEL_PATH = "models/qwen2.5-7b-instruct-q4_k_m.gguf"
 
 
 def _run_splitter(
@@ -68,7 +67,7 @@ def main() -> None:
     model = WhisperModel("base", device="cuda", compute_type="float16")
     transcribe_fn = WhisperAdapter(
         model,
-        language="en",
+        language=None,
         vad_filter=True,
         vad_parameters={"min_silence_duration_ms": 500},
         beam_size=5,
@@ -95,7 +94,7 @@ def main() -> None:
     )
 
     store = TranscriptStore()
-    llm = LLMEngine(model_path=LLM_MODEL_PATH)
+    llm = LLMEngine()
     overlay = Overlay(events_queue=overlay_events, store=store, llm=llm)
 
     # When the overlay (last window) closes, stop everything.
