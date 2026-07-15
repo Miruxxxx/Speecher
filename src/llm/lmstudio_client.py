@@ -119,6 +119,10 @@ class LMStudioClient:
             stream=True,
         )
         for chunk in stream:
+            # Some OpenAI-compatible servers send a final chunk with an empty
+            # choices list (usage-only); indexing it blindly would raise.
+            if not chunk.choices:
+                continue
             delta = chunk.choices[0].delta.content
             if delta:
                 yield delta

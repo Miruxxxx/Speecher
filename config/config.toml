@@ -51,6 +51,7 @@ temperature = 0.6
 max_tokens = 2048
 request_timeout_sec = 120.0
 health_timeout_sec = 2.0      # таймаут проверки доступности сервера
+max_summary_chars = 6000      # лимит символов транскрипта в промпте саммари (лишнее с начала отбрасывается)
 qwen_no_think = true          # подставлять /no_think (Qwen3-специфика)
 
 [ui]

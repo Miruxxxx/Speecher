@@ -68,15 +68,18 @@ class Overlay(QWidget):
         store: TranscriptStore,
         llm: LLMEngine,
         max_recent_chars: int = 700,
+        max_summary_chars: int = 6000,
     ) -> None:
         super().__init__()
         self._events = events_queue
         self._store = store
         self._llm = llm
         self._max_recent_chars = max_recent_chars
+        self._max_summary_chars = max_summary_chars
         self._partial = ""
         self._llm_output = ""
         self._llm_busy = False
+        self._fatal_active = False
         self._drag_pos: Optional[QPoint] = None
 
         self._setup_window()
@@ -93,6 +96,11 @@ class Overlay(QWidget):
         self._repaint_timer.timeout.connect(self._refresh_transcript)
         self._repaint_timer.start(3000)
 
+        # Re-probe LM Studio periodically so the banner tracks the server going
+        # up or down after startup, not just its state 500 ms in.
+        self._health_timer = QTimer(self)
+        self._health_timer.timeout.connect(self._check_lm_availability)
+        self._health_timer.start(20000)
         QTimer.singleShot(500, self._check_lm_availability)
 
     # ------------------------------------------------------------------
@@ -268,7 +276,30 @@ class Overlay(QWidget):
             self._partial = ev.text
             self._refresh_transcript()
         elif ev.type == "fatal":
-            self.post_status(f"[FATAL {ev.source}] {ev.text}")
+            # Show the reason before the app tears down. main's shutdown timer
+            # defers to fatal_active() so the process doesn't quit underneath
+            # this dialog (its stop_event is already set). Guard re-entry: more
+            # fatal events may be queued behind this one.
+            if not self._fatal_active:
+                self._fatal_active = True
+                QTimer.singleShot(0, lambda: self._on_fatal(f"[{ev.source}] {ev.text}"))
+
+    def fatal_active(self) -> bool:
+        """True once a fatal error is being surfaced; main defers its quit."""
+        return self._fatal_active
+
+    def _on_fatal(self, msg: str) -> None:
+        from PyQt6.QtWidgets import QApplication, QMessageBox
+
+        self._poll_timer.stop()
+        self._repaint_timer.stop()
+        self._health_timer.stop()
+        QMessageBox.critical(
+            self,
+            "Speecher — фатальная ошибка",
+            f"Пайплайн остановлен и приложение закроется:\n\n{msg}",
+        )
+        QApplication.instance().quit()
 
     # ------------------------------------------------------------------
     # Display helpers
@@ -308,7 +339,8 @@ class Overlay(QWidget):
         ctx = self._store.context_for_question(q, max_chars=1500)
         prompt = (
             "You are given a speech transcript excerpt. "
-            "Answer the question that appears at the end concisely and helpfully.\n\n"
+            "Answer the question that appears at the end concisely and helpfully. "
+            "Reply in the same language as the question.\n\n"
             f"Transcript:\n{ctx}\n\nQuestion: {q}"
         )
         self._start_llm(prompt)
@@ -339,9 +371,17 @@ class Overlay(QWidget):
                 f"[No transcript in the last {int(minutes)} minutes]"
             )
             return
+        # Keep the most recent text within budget so a long window can't
+        # silently overflow the local model's context (LM Studio would drop
+        # the middle without telling us).
+        truncated = len(text) > self._max_summary_chars
+        if truncated:
+            text = text[-self._max_summary_chars:]
         prompt = (
             f"Summarize the following speech transcript from the last {int(minutes)} "
-            "minutes. Focus on key points, decisions, and important information:\n\n"
+            "minutes. Focus on key points, decisions, and important information. "
+            "Reply in the same language as the transcript.\n\n"
+            + ("[earlier text omitted]\n" if truncated else "")
             + text
         )
         self._start_llm(prompt)
@@ -363,6 +403,10 @@ class Overlay(QWidget):
     # ------------------------------------------------------------------
 
     def _check_lm_availability(self) -> None:
+        # A concurrent health probe mid-generation could flip the banner on a
+        # transient miss while tokens are clearly flowing; skip it while busy.
+        if self._llm_busy:
+            return
         # models.list() is a network call — keep it off the UI thread.
         def probe() -> None:
             self._lm_health_sig.emit(self._llm.is_available())
@@ -411,4 +455,8 @@ class Overlay(QWidget):
         self._set_buttons_enabled(True)
         if "недоступен" in msg:
             self._lm_warning.setVisible(True)
-        self._show_llm_output(f"[LLM Error] {msg}")
+        # Keep any tokens already streamed (a mid-stream failure shouldn't wipe
+        # a half-written answer); append the error instead of replacing.
+        partial = self._llm_output if self._llm_output not in ("", "…") else ""
+        prefix = partial + "\n\n" if partial else ""
+        self._show_llm_output(f"{prefix}[LLM Error] {msg}")

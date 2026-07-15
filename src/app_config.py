@@ -69,6 +69,9 @@ class LlmConfig:
     max_tokens: int = 2048
     request_timeout_sec: float = 120.0
     health_timeout_sec: float = 2.0
+    # Cap on transcript chars sent in a summary prompt: past this the oldest
+    # text is dropped so we never silently overflow a small local context.
+    max_summary_chars: int = 6000
     # Prepend /no_think for Qwen3-family models.
     qwen_no_think: bool = True
 

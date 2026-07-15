@@ -182,14 +182,31 @@ def main() -> None:
         store=store,
         llm=llm,
         max_recent_chars=cfg.ui.max_recent_chars,
+        max_summary_chars=cfg.llm.max_summary_chars,
     )
 
     # When the overlay (last window) closes, stop everything.
     app.aboutToQuit.connect(stop_event.set)
 
     # Forward a fatal stop_event (set by engine/capture) into Qt's event loop.
+    # If the overlay is surfacing the fatal reason in a dialog, defer to it so
+    # the process doesn't quit underneath the message. One grace tick covers
+    # the gap between stop_event being set and the overlay polling the fatal
+    # event; if no dialog appears (the fatal event was dropped), we still quit.
+    shutdown_grace = [1]
+
+    def _check_shutdown() -> None:
+        if not stop_event.is_set():
+            return
+        if overlay.fatal_active():
+            return  # the overlay owns the quit once its dialog is dismissed
+        if shutdown_grace[0] > 0:
+            shutdown_grace[0] -= 1
+            return
+        app.quit()
+
     shutdown_check = QTimer()
-    shutdown_check.timeout.connect(lambda: app.quit() if stop_event.is_set() else None)
+    shutdown_check.timeout.connect(_check_shutdown)
     shutdown_check.start(500)
 
     splitter_thread = threading.Thread(
