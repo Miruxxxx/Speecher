@@ -20,3 +20,6 @@ storage/transcripts/*
 
 # Логи
 *.log
+
+# Claude Code (личные настройки, не коммитить)
+.claude/settings.local.json
