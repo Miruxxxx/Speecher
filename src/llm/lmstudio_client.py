@@ -1,76 +1,72 @@
 from __future__ import annotations
 
-import threading
-from typing import Callable, Generator, Iterator, List, Optional
+import logging
+from typing import Generator, Iterator, List, Optional
 
 import openai
+
+from app_config import LlmConfig
+
+logger = logging.getLogger(__name__)
 
 
 class LMStudioClient:
     """
     Тонкая обёртка над LM Studio OpenAI-compatible API.
 
-    Использование:
-        client = LMStudioClient()
-
-        # Проверить что сервер живой
-        if not client.is_available():
-            print("LM Studio не запущен")
-
-        # Стриминг
-        for chunk in client.stream_completion(messages=[...]):
-            print(chunk, end="", flush=True)
-
-        # Одним куском
-        text = client.complete(messages=[...])
+    Всё сетевое настроено на «локальный сервер, который может быть выключен»:
+    без ретраев, health-check с коротким таймаутом. Вызовы блокирующие —
+    использовать только из LLM-потока (LLMEngine), не из UI.
     """
 
-    def __init__(
-        self,
-        base_url: str = "http://localhost:1234/v1",
-        model: str = "qwen3.5-9b",
-        temperature: float = 0.6,
-        max_tokens: int = 2048,
-        timeout: float = 10.0,
-    ) -> None:
-        self._model = model
-        self._temperature = temperature
-        self._max_tokens = max_tokens
-        self._timeout = timeout
-        # api_key обязателен для openai клиента, но LM Studio его игнорирует
+    def __init__(self, cfg: Optional[LlmConfig] = None) -> None:
+        self._cfg = cfg or LlmConfig()
+        # api_key обязателен для openai-клиента, но LM Studio его игнорирует.
         self._client = openai.OpenAI(
-            base_url=base_url,
+            base_url=self._cfg.base_url,
             api_key="lm-studio",
+            timeout=self._cfg.request_timeout_sec,
+            max_retries=0,
         )
 
     # ------------------------------------------------------------------
-    # Health check
+    # Health / model resolution
     # ------------------------------------------------------------------
 
     def is_available(self) -> bool:
-        """Быстрая проверка что LM Studio сервер запущен и модель загружена."""
+        """Быстрая проверка, что сервер запущен и модель загружена."""
         try:
-            models = self._client.models.list()
+            models = self._client.with_options(
+                timeout=self._cfg.health_timeout_sec
+            ).models.list()
             return len(models.data) > 0
         except Exception:
             return False
 
     def loaded_model_id(self) -> Optional[str]:
-        """Вернуть ID первой загруженной модели, или None."""
+        """ID первой загруженной модели, или None."""
         try:
-            models = self._client.models.list()
+            models = self._client.with_options(
+                timeout=self._cfg.health_timeout_sec
+            ).models.list()
             if models.data:
                 return models.data[0].id
         except Exception:
             pass
         return None
 
+    def resolve_model(self) -> Optional[str]:
+        """Модель из конфига, иначе — первая загруженная в LM Studio."""
+        if self._cfg.model:
+            return self._cfg.model
+        return self.loaded_model_id()
+
     # ------------------------------------------------------------------
-    # Системный промпт
+    # Промпт-обвязка
     # ------------------------------------------------------------------
 
     @staticmethod
-    def _no_think_system() -> dict:
+    def _system_message() -> dict:
         return {
             "role": "system",
             "content": "You are a helpful, concise assistant.",
@@ -89,8 +85,18 @@ class LMStudioClient:
                 out.append(msg)
         return out
 
+    def _prepare(self, messages: List[dict], include_system: bool) -> List[dict]:
+        all_messages: List[dict] = []
+        if include_system:
+            all_messages.append(self._system_message())
+        if self._cfg.qwen_no_think:
+            all_messages.extend(self._inject_no_think(messages))
+        else:
+            all_messages.extend(messages)
+        return all_messages
+
     # ------------------------------------------------------------------
-    # Стриминг
+    # Вызовы
     # ------------------------------------------------------------------
 
     def stream_completion(
@@ -101,35 +107,21 @@ class LMStudioClient:
         temperature: Optional[float] = None,
         max_tokens: Optional[int] = None,
     ) -> Generator[str, None, None]:
-        """
-        Стримит токены по одному. Используй в отдельном потоке.
-
-        Пример:
-            for token in client.stream_completion([
-                {"role": "user", "content": "Summarize: ..."}
-            ]):
-                print(token, end="", flush=True)
-        """
-        all_messages = []
-        if include_system:
-            all_messages.append(self._no_think_system())
-        all_messages.extend(self._inject_no_think(messages))
-
+        """Стримит токены по одному. Блокирует — использовать в LLM-потоке."""
+        model = self.resolve_model()
+        if model is None:
+            raise RuntimeError("LM Studio: нет загруженной модели")
         stream: Iterator = self._client.chat.completions.create(
-            model=self._model,
-            messages=all_messages,
-            temperature=temperature if temperature is not None else self._temperature,
-            max_tokens=max_tokens if max_tokens is not None else self._max_tokens,
+            model=model,
+            messages=self._prepare(messages, include_system),
+            temperature=temperature if temperature is not None else self._cfg.temperature,
+            max_tokens=max_tokens if max_tokens is not None else self._cfg.max_tokens,
             stream=True,
         )
         for chunk in stream:
             delta = chunk.choices[0].delta.content
             if delta:
                 yield delta
-
-    # ------------------------------------------------------------------
-    # Одним куском (для перевода — короткие ответы)
-    # ------------------------------------------------------------------
 
     def complete(
         self,
@@ -140,58 +132,14 @@ class LMStudioClient:
         max_tokens: Optional[int] = None,
     ) -> str:
         """Блокирующий вызов, возвращает полный текст ответа."""
-        all_messages = []
-        if include_system:
-            all_messages.append(self._no_think_system())
-        all_messages.extend(self._inject_no_think(messages))
-
+        model = self.resolve_model()
+        if model is None:
+            raise RuntimeError("LM Studio: нет загруженной модели")
         response = self._client.chat.completions.create(
-            model=self._model,
-            messages=all_messages,
-            temperature=temperature if temperature is not None else self._temperature,
-            max_tokens=max_tokens if max_tokens is not None else self._max_tokens,
+            model=model,
+            messages=self._prepare(messages, include_system),
+            temperature=temperature if temperature is not None else self._cfg.temperature,
+            max_tokens=max_tokens if max_tokens is not None else self._cfg.max_tokens,
             stream=False,
         )
         return (response.choices[0].message.content or "").strip()
-
-    # ------------------------------------------------------------------
-    # Хелперы для конкретных задач
-    # ------------------------------------------------------------------
-
-    def translate(self, text: str, target_language: str = "English") -> str:
-        """Перевод одного committed-чанка. Неблокирующий вывод не нужен — чанки короткие."""
-        return self.complete(
-            messages=[{
-                "role": "user",
-                "content": f"Translate to {target_language}. Output only the translation, nothing else:\n{text}",
-            }],
-            max_tokens=256,
-            temperature=0.3,
-        )
-
-    def summarize(self, text: str, minutes: Optional[float] = None) -> Generator[str, None, None]:
-        """Саммари с стримингом. minutes=None -> всего текста."""
-        label = f"the last {minutes} minutes of" if minutes else "the following"
-        return self.stream_completion(
-            messages=[{
-                "role": "user",
-                "content": (
-                    f"Write a concise summary of {label} this meeting transcript. "
-                    f"Use bullet points. Focus on decisions, action items, and key points:\n\n{text}"
-                ),
-            }],
-            max_tokens=512,
-        )
-
-    def answer_question(self, question: str, context: str) -> Generator[str, None, None]:
-        """Ответ на последний вопрос из контекста разговора."""
-        return self.stream_completion(
-            messages=[{
-                "role": "user",
-                "content": (
-                    f"Based on this meeting transcript context:\n\n{context}\n\n"
-                    f"Answer this question concisely: {question}"
-                ),
-            }],
-            max_tokens=300,
-        )

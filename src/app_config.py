@@ -1,0 +1,128 @@
+from __future__ import annotations
+
+import logging
+import tomllib
+from dataclasses import dataclass, field, fields, is_dataclass
+from pathlib import Path
+from typing import Any
+
+logger = logging.getLogger(__name__)
+
+
+@dataclass(slots=True)
+class AudioConfig:
+    device_hint: str = "HyperX"
+    target_sample_rate: int = 16000
+    frames_per_buffer: int = 2048
+    max_channels: int = 2
+    restart_backoff_sec: float = 2.0
+
+
+@dataclass(slots=True)
+class AsrFiltersConfig:
+    # Segments with no_speech_prob above / avg_logprob below these are dropped.
+    no_speech_prob_max: float = 0.9
+    avg_logprob_min: float = -1.5
+    # Collapse runs of the same normalized word longer than this (hallucination loops).
+    max_word_repeats: int = 6
+    # Snapshot RMS below this counts as silence: Whisper is not called at all.
+    silence_rms_threshold: float = 1e-4
+    # After this many consecutive empty decodes the buffer is trimmed to the tail.
+    empty_decodes_before_trim: int = 3
+    silence_keep_tail_sec: float = 2.0
+
+
+@dataclass(slots=True)
+class AsrConfig:
+    model: str = "large-v3-turbo"
+    device: str = "cuda"            # cuda | cpu
+    compute_type: str = "float16"   # float16 | int8 | auto
+    # "auto" = sticky: detect once from the first confident decode, then pin.
+    # "" = re-detect every cycle (old behaviour). "ru"/"en"/... = fixed.
+    language: str = "auto"
+    sticky_min_probability: float = 0.7
+    beam_size: int = 5
+    vad_min_silence_ms: int = 500
+    chunk_interval_sec: float = 1.0
+    min_audio_sec: float = 1.0
+    commit_safety_margin_sec: float = 0.1
+    max_buffer_sec: float = 25.0
+    force_commit_keep_tail_words: int = 6
+    buffer_max_seconds: float = 60.0
+    filters: AsrFiltersConfig = field(default_factory=AsrFiltersConfig)
+
+
+@dataclass(slots=True)
+class PunctuationConfig:
+    backend: str = "silero"   # silero | deepmultilingual | off
+    language: str = "ru"      # silero supports ru/en/de/es
+    interval_sec: float = 12.0
+    context_words: int = 80
+
+
+@dataclass(slots=True)
+class LlmConfig:
+    base_url: str = "http://localhost:1234/v1"
+    # "" = use whatever model is loaded in LM Studio (first from /models).
+    model: str = ""
+    temperature: float = 0.6
+    max_tokens: int = 2048
+    request_timeout_sec: float = 120.0
+    health_timeout_sec: float = 2.0
+    # Prepend /no_think for Qwen3-family models.
+    qwen_no_think: bool = True
+
+
+@dataclass(slots=True)
+class UiConfig:
+    max_recent_chars: int = 700
+    console_verbose_logs: bool = False
+
+
+@dataclass(slots=True)
+class AppConfig:
+    audio: AudioConfig = field(default_factory=AudioConfig)
+    asr: AsrConfig = field(default_factory=AsrConfig)
+    punctuation: PunctuationConfig = field(default_factory=PunctuationConfig)
+    llm: LlmConfig = field(default_factory=LlmConfig)
+    ui: UiConfig = field(default_factory=UiConfig)
+
+
+def _apply_section(obj: Any, data: dict, path: str) -> None:
+    """Overlay a TOML table onto a config dataclass, coercing to field types."""
+    known = {f.name: f for f in fields(obj)}
+    for key, value in data.items():
+        if key not in known:
+            logger.warning("config: unknown key %s.%s ignored", path, key)
+            continue
+        current = getattr(obj, key)
+        if is_dataclass(current):
+            if isinstance(value, dict):
+                _apply_section(current, value, f"{path}.{key}")
+            else:
+                logger.warning("config: %s.%s must be a table; ignored", path, key)
+            continue
+        try:
+            setattr(obj, key, type(current)(value))
+        except (TypeError, ValueError):
+            logger.warning(
+                "config: %s.%s=%r has wrong type (expected %s); keeping default %r",
+                path, key, value, type(current).__name__, current,
+            )
+
+
+def load_config(path: str | Path) -> AppConfig:
+    """Load config/config.toml over built-in defaults. Missing file → defaults."""
+    cfg = AppConfig()
+    p = Path(path)
+    if not p.exists():
+        logger.info("config: %s not found, using defaults", p)
+        return cfg
+    try:
+        with open(p, "rb") as f:
+            data = tomllib.load(f)
+    except (OSError, tomllib.TOMLDecodeError) as exc:
+        logger.error("config: failed to read %s (%s); using defaults", p, exc)
+        return cfg
+    _apply_section(cfg, data, "config")
+    return cfg

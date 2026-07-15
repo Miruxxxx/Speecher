@@ -64,6 +64,10 @@ class TranscriptStore:
         start = max(0, end - max_chars)
         return text[start:end].strip()
 
+    def size(self) -> int:
+        with self._lock:
+            return len(self._entries)
+
     def get_tail(self, n_words: int) -> tuple[int, list[Word]]:
         with self._lock:
             total = len(self._entries)

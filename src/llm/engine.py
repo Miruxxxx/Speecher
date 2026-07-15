@@ -28,8 +28,8 @@ class LLMEngine:
     wire them to Qt signals so updates safely land on the UI thread.
     """
 
-    def __init__(self) -> None:
-        self._client = LMStudioClient()
+    def __init__(self, client: Optional[LMStudioClient] = None) -> None:
+        self._client = client or LMStudioClient()
         self._queue: queue.Queue[Optional[LLMTask]] = queue.Queue()
         self._thread = threading.Thread(target=self._run, name="llm", daemon=True)
 
@@ -59,8 +59,11 @@ class LLMEngine:
             self._process(task)
 
     def _process(self, task: LLMTask) -> None:
+        # Availability is checked here, in the LLM thread — never block the UI
+        # thread on network calls (the client has short health timeouts and
+        # no retries, so a dead server fails fast).
         if not self._client.is_available():
-            task.on_error("LM Studio недоступен — запустите сервер на :1234")
+            task.on_error("LM Studio недоступен — запустите сервер")
             return
         try:
             messages = [{"role": "user", "content": task.prompt}]

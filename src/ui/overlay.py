@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import queue
+import threading
 from typing import Optional
 
 from PyQt6.QtCore import Qt, QPoint, QTimer, pyqtSignal
@@ -58,6 +59,8 @@ class Overlay(QWidget):
     _llm_token_sig = pyqtSignal(str)
     _llm_done_sig = pyqtSignal()
     _llm_error_sig = pyqtSignal(str)
+    _status_sig = pyqtSignal(str)
+    _lm_health_sig = pyqtSignal(bool)
 
     def __init__(
         self,
@@ -83,6 +86,12 @@ class Overlay(QWidget):
         self._poll_timer = QTimer(self)
         self._poll_timer.timeout.connect(self._poll_events)
         self._poll_timer.start(50)
+
+        # The punctuation worker rewrites committed words in place without
+        # emitting events; re-render periodically so its edits become visible.
+        self._repaint_timer = QTimer(self)
+        self._repaint_timer.timeout.connect(self._refresh_transcript)
+        self._repaint_timer.start(3000)
 
         QTimer.singleShot(500, self._check_lm_availability)
 
@@ -119,6 +128,16 @@ class Overlay(QWidget):
         )
         self._lm_warning.setVisible(False)
         root.addWidget(self._lm_warning)
+
+        # App status line (model loading progress, load errors)
+        self._status_lbl = QLabel("")
+        self._status_lbl.setStyleSheet(
+            "QLabel { color: #9fd49f; background: rgba(30,60,30,150); "
+            "padding: 3px 8px; border-radius: 3px; font-size: 10px; }"
+        )
+        self._status_lbl.setVisible(False)
+        self._status_lbl.setWordWrap(True)
+        root.addWidget(self._status_lbl)
 
         # Title bar / drag handle
         title_row = QHBoxLayout()
@@ -184,6 +203,8 @@ class Overlay(QWidget):
         self._llm_token_sig.connect(self._on_llm_token)
         self._llm_done_sig.connect(self._on_llm_done)
         self._llm_error_sig.connect(self._on_llm_error)
+        self._status_sig.connect(self._on_status)
+        self._lm_health_sig.connect(self._on_lm_health)
 
     # ------------------------------------------------------------------
     # Background painting
@@ -239,14 +260,15 @@ class Overlay(QWidget):
 
     def _handle_asr(self, ev: ASREvent) -> None:
         if ev.type == "commit":
-            self._store.append(ev.words)
+            # The splitter already appended the words to the store (so a
+            # dropped UI event can't lose transcript data); just re-render.
             self._partial = ""
             self._refresh_transcript()
         elif ev.type == "partial":
             self._partial = ev.text
             self._refresh_transcript()
         elif ev.type == "fatal":
-            self._show_llm_output(f"[FATAL] {ev.text}")
+            self.post_status(f"[FATAL {ev.source}] {ev.text}")
 
     # ------------------------------------------------------------------
     # Display helpers
@@ -325,18 +347,34 @@ class Overlay(QWidget):
         self._start_llm(prompt)
 
     # ------------------------------------------------------------------
+    # Status line (thread-safe entry point for loader threads)
+    # ------------------------------------------------------------------
+
+    def post_status(self, text: str) -> None:
+        """Show text in the status line; empty string hides it. Any thread."""
+        self._status_sig.emit(text)
+
+    def _on_status(self, text: str) -> None:
+        self._status_lbl.setText(text)
+        self._status_lbl.setVisible(bool(text))
+
+    # ------------------------------------------------------------------
     # LLM interaction
     # ------------------------------------------------------------------
 
     def _check_lm_availability(self) -> None:
-        self._lm_warning.setVisible(not self._llm.is_available())
+        # models.list() is a network call — keep it off the UI thread.
+        def probe() -> None:
+            self._lm_health_sig.emit(self._llm.is_available())
+
+        threading.Thread(target=probe, name="lm-health", daemon=True).start()
+
+    def _on_lm_health(self, ok: bool) -> None:
+        self._lm_warning.setVisible(not ok)
 
     def _start_llm(self, prompt: str) -> None:
-        if not self._llm.is_available():
-            self._lm_warning.setVisible(True)
-            self._show_llm_output("[LM Studio недоступен — запустите сервер на :1234]")
-            return
-        self._lm_warning.setVisible(False)
+        # No availability pre-check here: it would block the UI thread.
+        # The LLM thread checks and reports back through on_error.
         self._llm_busy = True
         self._set_buttons_enabled(False)
         self._show_llm_output("…")
@@ -355,6 +393,7 @@ class Overlay(QWidget):
             btn.setEnabled(enabled)
 
     def _on_llm_token(self, token: str) -> None:
+        self._lm_warning.setVisible(False)  # tokens flowing => server is alive
         if self._llm_output == "…":
             self._llm_output = ""
         self._llm_output += token
@@ -370,4 +409,6 @@ class Overlay(QWidget):
     def _on_llm_error(self, msg: str) -> None:
         self._llm_busy = False
         self._set_buttons_enabled(True)
+        if "недоступен" in msg:
+            self._lm_warning.setVisible(True)
         self._show_llm_output(f"[LLM Error] {msg}")

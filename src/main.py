@@ -1,53 +1,134 @@
 from __future__ import annotations
 
+import logging
 import queue
 import sys
 import threading
+from pathlib import Path
 
 from PyQt6.QtCore import QTimer
 from PyQt6.QtWidgets import QApplication
-from faster_whisper import WhisperModel
 
+from app_config import AppConfig, load_config
 from asr.events import ASREvent
+from asr.punctuation_backends import create_backend
 from asr.punctuation_worker import PunctuationWorker
 from asr.streaming_engine import StreamingASREngine
 from asr.whisper_adapter import WhisperAdapter
 from audio.buffer import GrowingAudioBuffer
-from audio.capture_stream import LoopbackStreamCapture
+from audio.capture_supervisor import CaptureSupervisor
 from llm.engine import LLMEngine
+from llm.lmstudio_client import LMStudioClient
 from store.transcript_store import TranscriptStore
 from ui.output_sink import OutputSink
 from ui.overlay import Overlay
 from utils.latency import LatencyTracker
 
+logger = logging.getLogger(__name__)
 
-TARGET_SR = 16000
-ADD_PUNCTUATION = True
+PROJECT_ROOT = Path(__file__).resolve().parent.parent
+CONFIG_PATH = PROJECT_ROOT / "config" / "config.toml"
 
 
 def _run_splitter(
     source: "queue.Queue[ASREvent]",
     sinks: "list[queue.Queue[ASREvent]]",
+    store: TranscriptStore,
     stop_event: threading.Event,
 ) -> None:
-    """Fan-out: reads one source queue and copies each event to all sinks."""
+    """Fan-out: reads one source queue and copies each event to all sinks.
+
+    Commits are also appended to the TranscriptStore *here*, so the store
+    (the source of truth for summaries/questions) never loses words to a
+    full UI queue — sinks only render.
+    """
     while not stop_event.is_set():
         try:
             ev = source.get(timeout=0.1)
         except queue.Empty:
             continue
+        if ev.type == "commit":
+            store.append(ev.words)
         for q in sinks:
             try:
                 q.put_nowait(ev)
             except queue.Full:
+                # Sinks are render-only; a dropped event costs at most a
+                # slightly stale view until the next one arrives.
                 pass
         source.task_done()
 
 
+class _Pipeline:
+    """Holds pipeline pieces created by the background loader thread."""
+
+    def __init__(self) -> None:
+        self.engine_thread: threading.Thread | None = None
+
+
+def _load_asr_pipeline(
+    cfg: AppConfig,
+    audio_buffer: GrowingAudioBuffer,
+    raw_events: "queue.Queue[ASREvent]",
+    stop_event: threading.Event,
+    latency: LatencyTracker,
+    overlay: Overlay,
+    pipeline: _Pipeline,
+) -> None:
+    """Loads Whisper and starts the engine. Runs in a background thread so
+    the overlay window is interactive from the first second."""
+    try:
+        overlay.post_status(f"Загружаю Whisper ({cfg.asr.model}, {cfg.asr.device})…")
+        from faster_whisper import WhisperModel  # heavy import, keep it here
+
+        model = WhisperModel(
+            cfg.asr.model, device=cfg.asr.device, compute_type=cfg.asr.compute_type
+        )
+        transcribe_fn = WhisperAdapter(
+            model,
+            language=cfg.asr.language if cfg.asr.language not in ("", "auto") else None,
+            sticky_language=cfg.asr.language == "auto",
+            sticky_min_probability=cfg.asr.sticky_min_probability,
+            vad_filter=True,
+            vad_parameters={"min_silence_duration_ms": cfg.asr.vad_min_silence_ms},
+            beam_size=cfg.asr.beam_size,
+            condition_on_previous_text=False,
+            no_speech_prob_max=cfg.asr.filters.no_speech_prob_max,
+            avg_logprob_min=cfg.asr.filters.avg_logprob_min,
+            max_word_repeats=cfg.asr.filters.max_word_repeats,
+        )
+        engine = StreamingASREngine(
+            audio_buffer=audio_buffer,
+            transcribe_fn=transcribe_fn,
+            events=raw_events,
+            stop_event=stop_event,
+            chunk_interval_sec=cfg.asr.chunk_interval_sec,
+            min_audio_sec=cfg.asr.min_audio_sec,
+            commit_safety_margin_sec=cfg.asr.commit_safety_margin_sec,
+            max_buffer_sec=cfg.asr.max_buffer_sec,
+            force_commit_keep_tail_words=cfg.asr.force_commit_keep_tail_words,
+            silence_rms_threshold=cfg.asr.filters.silence_rms_threshold,
+            empty_decodes_before_trim=cfg.asr.filters.empty_decodes_before_trim,
+            silence_keep_tail_sec=cfg.asr.filters.silence_keep_tail_sec,
+            latency=latency,
+        )
+        if stop_event.is_set():  # app closed while the model was loading
+            return
+        pipeline.engine_thread = threading.Thread(
+            target=engine.run, name="engine", daemon=True
+        )
+        pipeline.engine_thread.start()
+        overlay.post_status("")
+    except Exception as exc:
+        logger.exception("ASR pipeline failed to load")
+        overlay.post_status(f"Ошибка загрузки ASR: {exc}")
+
+
 def main() -> None:
-    import logging
-    logging.basicConfig(level=logging.INFO,
-                        format="%(asctime)s %(levelname)s %(name)s: %(message)s")
+    logging.basicConfig(
+        level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s"
+    )
+    cfg = load_config(CONFIG_PATH)
 
     app = QApplication(sys.argv)
 
@@ -59,58 +140,36 @@ def main() -> None:
     sink_events: "queue.Queue[ASREvent]" = queue.Queue(maxsize=400)
     overlay_events: "queue.Queue[ASREvent]" = queue.Queue(maxsize=400)
 
-    audio_buffer = GrowingAudioBuffer(sample_rate=TARGET_SR, max_seconds=60.0)
+    audio_buffer = GrowingAudioBuffer(
+        sample_rate=cfg.audio.target_sample_rate, max_seconds=cfg.asr.buffer_max_seconds
+    )
+    store = TranscriptStore()
 
-    capture = LoopbackStreamCapture(
+    capture = CaptureSupervisor(
         audio_buffer=audio_buffer,
-        name_hint="HyperX",
-        target_sr=TARGET_SR,
+        device_hint=cfg.audio.device_hint,
+        target_sr=cfg.audio.target_sample_rate,
         events=raw_events,
         stop_event=stop_event,
-        latency=latency,
-    )
-
-    model = WhisperModel("base", device="cuda", compute_type="float16")
-    transcribe_fn = WhisperAdapter(
-        model,
-        language=None,
-        vad_filter=True,
-        vad_parameters={"min_silence_duration_ms": 500},
-        beam_size=5,
-        condition_on_previous_text=False,
-    )
-
-    engine = StreamingASREngine(
-        audio_buffer=audio_buffer,
-        transcribe_fn=transcribe_fn,
-        events=raw_events,
-        stop_event=stop_event,
-        chunk_interval_sec=1.0,
-        min_audio_sec=1.0,
-        commit_safety_margin_sec=0.1,
-        max_buffer_sec=25.0,
-        force_commit_keep_tail_words=6,
+        frames_per_buffer=cfg.audio.frames_per_buffer,
+        max_channels=cfg.audio.max_channels,
+        restart_backoff_sec=cfg.audio.restart_backoff_sec,
         latency=latency,
     )
 
     sink = OutputSink(
         events=sink_events,
         stop_event=stop_event,
-        verbose_logs=False,
+        verbose_logs=cfg.ui.console_verbose_logs,
     )
 
-    store = TranscriptStore()
-
-    punct_thread: threading.Thread | None = None
-    if ADD_PUNCTUATION:
-        from deepmultilingualpunctuation import PunctuationModel as _PunctuationModel
-        _punct_model = _PunctuationModel()
-        _punct_worker = PunctuationWorker(store=store, model=_punct_model, stop_event=stop_event)
-        punct_thread = threading.Thread(target=_punct_worker.run, name="punctuation", daemon=True)
-        punct_thread.start()
-
-    llm = LLMEngine()
-    overlay = Overlay(events_queue=overlay_events, store=store, llm=llm)
+    llm = LLMEngine(LMStudioClient(cfg.llm))
+    overlay = Overlay(
+        events_queue=overlay_events,
+        store=store,
+        llm=llm,
+        max_recent_chars=cfg.ui.max_recent_chars,
+    )
 
     # When the overlay (last window) closes, stop everything.
     app.aboutToQuit.connect(stop_event.set)
@@ -122,25 +181,50 @@ def main() -> None:
 
     splitter_thread = threading.Thread(
         target=_run_splitter,
-        args=(raw_events, [sink_events, overlay_events], stop_event),
+        args=(raw_events, [sink_events, overlay_events], store, stop_event),
         name="splitter",
         daemon=True,
     )
     sink_thread = threading.Thread(target=sink.run, name="output", daemon=True)
-    engine_thread = threading.Thread(target=engine.run, name="engine", daemon=True)
 
+    # Window first, heavy models later: capture starts immediately (buffer
+    # caps itself), Whisper loads in the background and reports progress
+    # into the overlay's status line.
     llm.start()
     splitter_thread.start()
     sink_thread.start()
     capture.start()
-    engine_thread.start()
+
+    pipeline = _Pipeline()
+    loader_thread = threading.Thread(
+        target=_load_asr_pipeline,
+        args=(cfg, audio_buffer, raw_events, stop_event, latency, overlay, pipeline),
+        name="asr-loader",
+        daemon=True,
+    )
+    loader_thread.start()
+
+    punct_thread: threading.Thread | None = None
+    punct_backend = create_backend(cfg.punctuation.backend, cfg.punctuation.language)
+    if punct_backend is not None:
+        worker = PunctuationWorker(
+            store=store,
+            backend=punct_backend,
+            stop_event=stop_event,
+            interval_sec=cfg.punctuation.interval_sec,
+            context_words=cfg.punctuation.context_words,
+        )
+        punct_thread = threading.Thread(target=worker.run, name="punctuation", daemon=True)
+        punct_thread.start()
 
     overlay.show()
     ret = app.exec()
 
     stop_event.set()
     capture.stop()
-    engine_thread.join(timeout=3.0)
+    loader_thread.join(timeout=2.0)
+    if pipeline.engine_thread is not None:
+        pipeline.engine_thread.join(timeout=3.0)
     sink_thread.join(timeout=2.0)
     splitter_thread.join(timeout=2.0)
     if punct_thread is not None:

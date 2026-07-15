@@ -1,0 +1,58 @@
+# Конфигурация Speecher. Отсутствующие ключи берут значения по умолчанию
+# (см. src/app_config.py). Файл можно удалить целиком — приложение запустится
+# на дефолтах.
+
+[audio]
+device_hint = "HyperX"        # подстрока имени устройства вывода (loopback)
+target_sample_rate = 16000
+frames_per_buffer = 2048
+max_channels = 2
+restart_backoff_sec = 2.0     # пауза перед перезапуском упавшего capture-процесса
+
+[asr]
+# tiny/base/small/medium/large-v3, либо полный HF repo id.
+# large-v3-turbo указан явным репозиторием: короткий алиас в faster-whisper 1.2
+# ведёт на dropbox-dash/*, а этот вариант уже лежит в локальном кэше.
+model = "mobiuslabsgmbh/faster-whisper-large-v3-turbo"
+device = "cuda"               # cuda | cpu
+compute_type = "float16"      # float16 | int8 | auto
+# "auto" = определить язык один раз по первой уверенной речи и зафиксировать;
+# ""     = переопределять каждый цикл (старое поведение, даёт "кашу");
+# "ru", "en", ... = жёстко фиксированный язык.
+language = "auto"
+sticky_min_probability = 0.7  # порог уверенности для фиксации языка в режиме auto
+beam_size = 5
+vad_min_silence_ms = 500
+chunk_interval_sec = 1.0      # период цикла декодирования
+min_audio_sec = 1.0
+commit_safety_margin_sec = 0.1
+max_buffer_sec = 25.0         # force-commit при превышении
+force_commit_keep_tail_words = 6
+buffer_max_seconds = 60.0     # жёсткий cap аудиобуфера
+
+[asr.filters]
+no_speech_prob_max = 0.9      # сегменты с no_speech_prob выше — отбрасываются
+avg_logprob_min = -1.5        # сегменты с avg_logprob ниже — отбрасываются
+max_word_repeats = 6          # схлопывать подряд идущие повторы слова (галлюцинации)
+silence_rms_threshold = 1e-4  # RMS ниже порога = тишина, декод не запускается
+empty_decodes_before_trim = 3 # после N пустых декодов подряд буфер подрезается
+silence_keep_tail_sec = 2.0
+
+[punctuation]
+backend = "silero"            # silero (ru/en/de/es, CPU) | deepmultilingual (en/de/fr/it) | off
+language = "ru"               # язык для silero
+interval_sec = 12.0
+context_words = 80
+
+[llm]
+base_url = "http://localhost:1234/v1"
+model = ""                    # "" = первая загруженная в LM Studio модель
+temperature = 0.6
+max_tokens = 2048
+request_timeout_sec = 120.0
+health_timeout_sec = 2.0      # таймаут проверки доступности сервера
+qwen_no_think = true          # подставлять /no_think (Qwen3-специфика)
+
+[ui]
+max_recent_chars = 700
+console_verbose_logs = false  # показывать log-события движка в консоли
