@@ -65,6 +65,37 @@ def test_tick_strips_previous_punctuation_before_restore():
     assert seen["input"] == "Привет мир"  # edges stripped, case kept
 
 
+def test_tick_reasserts_whisper_question_mark():
+    # Backend (silero-like) drops the "?" and ends the sentence with ".".
+    store = _store_with("во", "сколько", "начнётся", "встреча?")
+    backend = FakeBackend(transform=lambda t: t + ".")
+    worker = _worker(store, backend)
+    backend.load()
+    worker._tick()
+    assert store.all_text() == "во сколько начнётся встреча?"
+
+
+def test_question_mark_reassertion_is_idempotent():
+    store = _store_with("сколько", "это", "стоит?")
+    backend = FakeBackend(transform=lambda t: t + ".")
+    worker = _worker(store, backend)
+    backend.load()
+    worker._tick()
+    assert store.all_text() == "сколько это стоит?"
+    worker._last_seen_size = -1  # force a re-run over the now-punctuated words
+    worker._tick()
+    assert store.all_text() == "сколько это стоит?"
+
+
+def test_keep_question_mark_helper():
+    k = PunctuationWorker._keep_question_mark
+    assert k("встреча?", "встреча.") == "встреча?"  # "." → "?"
+    assert k("встреча?", "встреча") == "встреча?"    # nothing → "?"
+    assert k("встреча?", "встреча?") == "встреча?"   # already "?"
+    assert k("дела", "дела?") == "дела?"             # model-added "?" left alone
+    assert k("мир", "мир.") == "мир."                # statements untouched
+
+
 def test_tick_skips_when_store_unchanged():
     store = _store_with("hello", "world")
     backend = FakeBackend()

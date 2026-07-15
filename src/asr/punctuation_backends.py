@@ -66,7 +66,12 @@ class SileroBackend:
         self._model = importer.load_pickle("te_model", "model")
 
     def restore(self, text: str) -> str:
-        return self._model.enhance_text(text, self._language)
+        # silero-te expects lowercase input and restores capitalization itself.
+        # Feeding already-capitalized text (the worker re-punctuates overlapping
+        # windows, so silero sees its own prior output) corrupts the leading
+        # letter ("Мы" -> "&Ы") or raises IndexError on short inputs. Lowercasing
+        # first is the model's intended usage and makes repeated passes stable.
+        return self._model.enhance_text(text.lower(), self._language)
 
 
 class FullstopBackend:

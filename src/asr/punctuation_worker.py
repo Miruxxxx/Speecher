@@ -12,6 +12,8 @@ logger = logging.getLogger(__name__)
 # Punctuation the models re-add; stripped from the input so repeated passes
 # over the same words stay idempotent.
 _EDGE_PUNCT_RE = re.compile(r"^[.,!?;:…]+|[.,!?;:…]+$")
+# Trailing punctuation on a single word, used to reassert Whisper's "?".
+_TRAILING_PUNCT_RE = re.compile(r"[.,!?;:…]+$")
 
 
 class PunctuationWorker:
@@ -91,4 +93,20 @@ class PunctuationWorker:
                 len(new_texts),
             )
             return
+        # Silero predicts terminal punctuation from text alone and routinely
+        # turns Whisper's "?" into "." (verified for ru, even with a question
+        # word present). Whisper's question marks come from prosody and are more
+        # reliable, so reassert them: any word that ended a question before the
+        # pass still ends one after it. Idempotent — the "?" is re-stripped by
+        # _EDGE_PUNCT_RE on the next tick before restore runs again.
+        new_texts = [
+            self._keep_question_mark(old.text, new)
+            for old, new in zip(words, new_texts)
+        ]
         self._store.update_word_texts(start_index, new_texts)
+
+    @staticmethod
+    def _keep_question_mark(old_text: str, new_text: str) -> str:
+        if old_text.endswith("?") and not new_text.endswith("?"):
+            return _TRAILING_PUNCT_RE.sub("", new_text) + "?"
+        return new_text
