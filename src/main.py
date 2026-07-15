@@ -81,9 +81,21 @@ def _load_asr_pipeline(
         overlay.post_status(f"Загружаю Whisper ({cfg.asr.model}, {cfg.asr.device})…")
         from faster_whisper import WhisperModel  # heavy import, keep it here
 
-        model = WhisperModel(
-            cfg.asr.model, device=cfg.asr.device, compute_type=cfg.asr.compute_type
-        )
+        try:
+            # Cached models load instantly and survive HF hiccups (renamed
+            # repos resolve to a new cache name and re-download; large-file
+            # CDN fetches have been seen hanging indefinitely on this box).
+            model = WhisperModel(
+                cfg.asr.model,
+                device=cfg.asr.device,
+                compute_type=cfg.asr.compute_type,
+                local_files_only=True,
+            )
+        except Exception:
+            overlay.post_status(f"Скачиваю модель {cfg.asr.model} с HuggingFace…")
+            model = WhisperModel(
+                cfg.asr.model, device=cfg.asr.device, compute_type=cfg.asr.compute_type
+            )
         transcribe_fn = WhisperAdapter(
             model,
             language=cfg.asr.language if cfg.asr.language not in ("", "auto") else None,
