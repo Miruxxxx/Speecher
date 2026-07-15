@@ -1,0 +1,22 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.venv/
+venv/
+
+# Visual Studio / VS Code
+.vs/
+.vscode/
+
+# Модели и артефакты
+models/
+*.gguf
+
+# Локальные данные
+storage/transcripts/*
+!storage/transcripts/.gitkeep
+
+# Логи
+*.log

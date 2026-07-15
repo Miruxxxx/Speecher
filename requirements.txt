@@ -1,0 +1,22 @@
+# Speecher — проверенные версии (Python 3.11, Windows).
+# ВАЖНО: faster-whisper на CUDA требует NVIDIA driver + cuBLAS/cuDNN 9
+# (ctranslate2 тянет их сам через pip-зависимости).
+# torch с CUDA ставится отдельным индексом:
+#   pip install torch --index-url https://download.pytorch.org/whl/cu128
+
+faster-whisper>=1.2.1
+PyAudioWPatch>=0.2.12.7
+PyQt6>=6.11.0
+numpy>=2.3
+scipy>=1.16
+openai>=2.34          # клиент для LM Studio (OpenAI-совместимый REST)
+
+# --- Пунктуация (опционально: ADD_PUNCTUATION в src/main.py) ---
+# Тянет torch + transformers (~4 GB). Модель fullstop-punctuation-multilang-large
+# скачивается с HuggingFace при первом запуске (~2.1 GB).
+deepmultilingualpunctuation>=1.0.1
+transformers>=5.0
+torch>=2.8
+
+# --- Dev ---
+pytest>=8.0
