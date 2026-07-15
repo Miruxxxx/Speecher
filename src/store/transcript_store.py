@@ -63,3 +63,20 @@ class TranscriptStore:
         end = pos + len(question)
         start = max(0, end - max_chars)
         return text[start:end].strip()
+
+    def get_tail(self, n_words: int) -> tuple[int, list[Word]]:
+        with self._lock:
+            total = len(self._entries)
+            start = max(0, total - n_words)
+            return start, [e[0] for e in self._entries[start:]]
+
+    def update_word_texts(self, start_index: int, new_texts: list[str]) -> None:
+        with self._lock:
+            if start_index + len(new_texts) > len(self._entries):
+                return
+            for i, text in enumerate(new_texts):
+                old_word, ts = self._entries[start_index + i]
+                self._entries[start_index + i] = (
+                    Word(text=text, start=old_word.start, end=old_word.end),
+                    ts,
+                )

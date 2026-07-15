@@ -9,6 +9,7 @@ from PyQt6.QtWidgets import QApplication
 from faster_whisper import WhisperModel
 
 from asr.events import ASREvent
+from asr.punctuation_worker import PunctuationWorker
 from asr.streaming_engine import StreamingASREngine
 from asr.whisper_adapter import WhisperAdapter
 from audio.buffer import GrowingAudioBuffer
@@ -21,6 +22,7 @@ from utils.latency import LatencyTracker
 
 
 TARGET_SR = 16000
+ADD_PUNCTUATION = True
 
 
 def _run_splitter(
@@ -43,6 +45,10 @@ def _run_splitter(
 
 
 def main() -> None:
+    import logging
+    logging.basicConfig(level=logging.INFO,
+                        format="%(asctime)s %(levelname)s %(name)s: %(message)s")
+
     app = QApplication(sys.argv)
 
     stop_event = threading.Event()
@@ -94,6 +100,15 @@ def main() -> None:
     )
 
     store = TranscriptStore()
+
+    punct_thread: threading.Thread | None = None
+    if ADD_PUNCTUATION:
+        from deepmultilingualpunctuation import PunctuationModel as _PunctuationModel
+        _punct_model = _PunctuationModel()
+        _punct_worker = PunctuationWorker(store=store, model=_punct_model, stop_event=stop_event)
+        punct_thread = threading.Thread(target=_punct_worker.run, name="punctuation", daemon=True)
+        punct_thread.start()
+
     llm = LLMEngine()
     overlay = Overlay(events_queue=overlay_events, store=store, llm=llm)
 
@@ -128,6 +143,8 @@ def main() -> None:
     engine_thread.join(timeout=3.0)
     sink_thread.join(timeout=2.0)
     splitter_thread.join(timeout=2.0)
+    if punct_thread is not None:
+        punct_thread.join(timeout=2.0)
     llm.stop()
     print(latency.report())
 
