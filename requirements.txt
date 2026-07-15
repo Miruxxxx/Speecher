@@ -8,15 +8,15 @@ faster-whisper>=1.2.1
 PyAudioWPatch>=0.2.12.7
 PyQt6>=6.11.0
 numpy>=2.3
-scipy>=1.16
+soxr>=1.0             # стриминговый ресемплер с состоянием
 openai>=2.34          # клиент для LM Studio (OpenAI-совместимый REST)
 
-# --- Пунктуация (опционально: ADD_PUNCTUATION в src/main.py) ---
-# Тянет torch + transformers (~4 GB). Модель fullstop-punctuation-multilang-large
-# скачивается с HuggingFace при первом запуске (~2.1 GB).
+# --- Пунктуация (config: [punctuation].backend) ---
+# silero (дефолт): torch + модель ~50 MB через torch.hub при первом запуске.
+# deepmultilingual: + transformers; модель ~2.1 GB с HuggingFace (EN/DE/FR/IT).
+torch>=2.8
 deepmultilingualpunctuation>=1.0.1
 transformers>=5.0
-torch>=2.8
 
 # --- Dev ---
 pytest>=8.0
