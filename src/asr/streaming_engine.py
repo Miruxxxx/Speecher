@@ -64,6 +64,9 @@ class StreamingASREngine:
         commit_safety_margin_sec: float = 0.1,
         max_buffer_sec: float = 25.0,
         force_commit_keep_tail_words: int = 6,
+        silence_rms_threshold: float = 1e-4,
+        empty_decodes_before_trim: int = 3,
+        silence_keep_tail_sec: float = 2.0,
         latency=None,
     ) -> None:
         if chunk_interval_sec <= 0:
@@ -86,8 +89,12 @@ class StreamingASREngine:
         self._commit_safety_margin_sec = float(commit_safety_margin_sec)
         self._max_buffer_sec = float(max_buffer_sec)
         self._force_commit_keep_tail_words = int(force_commit_keep_tail_words)
+        self._silence_rms_threshold = float(silence_rms_threshold)
+        self._empty_decodes_before_trim = max(1, int(empty_decodes_before_trim))
+        self._silence_keep_tail_sec = float(silence_keep_tail_sec)
 
         self._prev_hypothesis: List[Word] = []
+        self._empty_decodes = 0
 
     # ------------------------------------------------------------------
     # Main loop
@@ -125,6 +132,12 @@ class StreamingASREngine:
         if len(audio) < self._min_audio_samples:
             return
 
+        # Silence gate: don't burn a GPU decode on an all-quiet buffer.
+        rms = float(np.sqrt(np.mean(np.square(audio))))
+        if rms < self._silence_rms_threshold:
+            self._register_empty_decode()
+            return
+
         t0 = time.perf_counter()
         local_words = self._transcribe(audio)
         if self._latency is not None:
@@ -133,7 +146,9 @@ class StreamingASREngine:
         if not local_words:
             # Nothing recognized this round (silence / VAD filtered everything).
             # Don't reset prev_hypothesis - silence is not disagreement.
+            self._register_empty_decode()
             return
+        self._empty_decodes = 0
 
         current = [
             Word(text=w.text, start=w.start + offset_sec, end=w.end + offset_sec)
@@ -166,6 +181,25 @@ class StreamingASREngine:
         # of unstable words and trim aggressively.
         if self._buffer.duration_sec() > self._max_buffer_sec:
             self._force_commit(current)
+
+    # ------------------------------------------------------------------
+    # Silence bookkeeping
+    # ------------------------------------------------------------------
+
+    def _register_empty_decode(self) -> None:
+        """
+        Without this, silence never trims the buffer: it grows to the hard cap
+        and every cycle re-decodes the whole window for nothing. After a few
+        consecutive empty decodes we keep only a short tail.
+        """
+        self._empty_decodes += 1
+        if self._empty_decodes < self._empty_decodes_before_trim:
+            return
+        self._empty_decodes = 0
+        keep = max(self._silence_keep_tail_sec, self._min_audio_samples / self._buffer.sample_rate)
+        trim_to = self._buffer.end_time_sec() - keep
+        self._buffer.trim_until(trim_to)
+        self._prev_hypothesis = []
 
     # ------------------------------------------------------------------
     # LocalAgreement-2 prefix
