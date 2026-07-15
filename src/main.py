@@ -131,6 +131,7 @@ def _load_asr_pipeline(
         )
         pipeline.engine_thread.start()
         overlay.post_status("")
+        logger.info("ASR engine started (model=%s)", cfg.asr.model)
     except Exception as exc:
         logger.exception("ASR pipeline failed to load")
         overlay.post_status(f"Ошибка загрузки ASR: {exc}")
