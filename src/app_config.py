@@ -8,6 +8,10 @@ from typing import Any
 
 logger = logging.getLogger(__name__)
 
+# Backends `create_asr_backend` knows how to build. Anything else falls back
+# to "whisper" with a warning instead of crashing at startup.
+KNOWN_ASR_ENGINES = ("whisper",)
+
 
 @dataclass(slots=True)
 class AudioConfig:
@@ -34,6 +38,8 @@ class AsrFiltersConfig:
 
 @dataclass(slots=True)
 class AsrConfig:
+    # Which ASR backend runs the recognition loop (see src/asr/backends.py).
+    engine: str = "whisper"
     model: str = "large-v3-turbo"
     device: str = "cuda"            # cuda | cpu
     compute_type: str = "float16"   # float16 | int8 | auto
@@ -128,4 +134,17 @@ def load_config(path: str | Path) -> AppConfig:
         logger.error("config: failed to read %s (%s); using defaults", p, exc)
         return cfg
     _apply_section(cfg, data, "config")
+    _normalize(cfg)
     return cfg
+
+
+def _normalize(cfg: AppConfig) -> None:
+    """Fix up values that are the right type but not a valid choice."""
+    engine = cfg.asr.engine.strip().lower()
+    if engine not in KNOWN_ASR_ENGINES:
+        logger.warning(
+            "config: asr.engine=%r is unknown (known: %s); using 'whisper'",
+            cfg.asr.engine, ", ".join(KNOWN_ASR_ENGINES),
+        )
+        engine = "whisper"
+    cfg.asr.engine = engine

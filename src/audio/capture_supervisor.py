@@ -46,6 +46,7 @@ class CaptureSupervisor:
         max_channels: int = 2,
         restart_backoff_sec: float = 2.0,
         latency=None,
+        frame_sink: "Optional[queue.Queue[np.ndarray]]" = None,
     ) -> None:
         self._buffer = audio_buffer
         self._device_hint = device_hint
@@ -56,6 +57,8 @@ class CaptureSupervisor:
         self._max_channels = int(max_channels)
         self._restart_backoff_sec = float(restart_backoff_sec)
         self._latency = latency
+        self._frame_sink = frame_sink
+        self._frames_dropped = 0
 
         self._ctx = mp.get_context("spawn")
         self._thread: Optional[threading.Thread] = None
@@ -173,7 +176,10 @@ class CaptureSupervisor:
                     if resampler is not None:
                         audio = resampler.resample_chunk(audio)
                     if len(audio):
-                        self._buffer.write(audio.astype(np.float32, copy=False))
+                        audio = audio.astype(np.float32, copy=False)
+                        self._buffer.write(audio)
+                        if self._frame_sink is not None:
+                            self._push_frame(audio)
                     if self._latency is not None:
                         self._latency.mark("capture_convert", time.perf_counter() - t0)
                 elif kind == "fatal":
@@ -184,6 +190,22 @@ class CaptureSupervisor:
         return reason
 
     # -- helpers --------------------------------------------------------
+
+    def _push_frame(self, audio: np.ndarray) -> None:
+        """Hand the mono/resampled chunk to a push-style ASR backend.
+
+        Best effort by design: blocking here would stall the pump that feeds
+        the Whisper buffer, so a backend that can't keep up loses frames and
+        gets counted instead. The GrowingAudioBuffer path is unaffected.
+        """
+        try:
+            self._frame_sink.put_nowait(audio)
+        except queue.Full:
+            self._frames_dropped += 1
+            if self._frames_dropped % 100 == 1:
+                self._emit_log(
+                    f"frame_sink full; dropped {self._frames_dropped} chunks so far"
+                )
 
     def _terminate_child(self) -> None:
         child = self._child

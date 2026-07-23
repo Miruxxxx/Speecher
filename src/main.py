@@ -10,11 +10,10 @@ from PyQt6.QtCore import QTimer
 from PyQt6.QtWidgets import QApplication
 
 from app_config import AppConfig, load_config
+from asr.backends import create_asr_backend
 from asr.events import ASREvent
 from asr.punctuation_backends import create_backend
 from asr.punctuation_worker import PunctuationWorker
-from asr.streaming_engine import StreamingASREngine
-from asr.whisper_adapter import WhisperAdapter
 from audio.buffer import GrowingAudioBuffer
 from audio.capture_supervisor import CaptureSupervisor
 from llm.engine import LLMEngine
@@ -75,59 +74,23 @@ def _load_asr_pipeline(
     overlay: Overlay,
     pipeline: _Pipeline,
 ) -> None:
-    """Loads Whisper and starts the engine. Runs in a background thread so
-    the overlay window is interactive from the first second."""
+    """Loads the ASR backend and starts its loop. Runs in a background thread
+    so the overlay window is interactive from the first second."""
     try:
-        overlay.post_status(f"Загружаю Whisper ({cfg.asr.model}, {cfg.asr.device})…")
-        from faster_whisper import WhisperModel  # heavy import, keep it here
-
-        try:
-            # Cached models load instantly and survive HF hiccups (renamed
-            # repos resolve to a new cache name and re-download; large-file
-            # CDN fetches have been seen hanging indefinitely on this box).
-            model = WhisperModel(
-                cfg.asr.model,
-                device=cfg.asr.device,
-                compute_type=cfg.asr.compute_type,
-                local_files_only=True,
-            )
-        except Exception:
-            overlay.post_status(f"Скачиваю модель {cfg.asr.model} с HuggingFace…")
-            model = WhisperModel(
-                cfg.asr.model, device=cfg.asr.device, compute_type=cfg.asr.compute_type
-            )
-        transcribe_fn = WhisperAdapter(
-            model,
-            language=cfg.asr.language if cfg.asr.language not in ("", "auto") else None,
-            sticky_language=cfg.asr.language == "auto",
-            sticky_min_probability=cfg.asr.sticky_min_probability,
-            vad_filter=True,
-            vad_parameters={"min_silence_duration_ms": cfg.asr.vad_min_silence_ms},
-            beam_size=cfg.asr.beam_size,
-            condition_on_previous_text=False,
-            no_speech_prob_max=cfg.asr.filters.no_speech_prob_max,
-            avg_logprob_min=cfg.asr.filters.avg_logprob_min,
-            max_word_repeats=cfg.asr.filters.max_word_repeats,
-        )
-        engine = StreamingASREngine(
+        backend = create_asr_backend(
+            cfg,
             audio_buffer=audio_buffer,
-            transcribe_fn=transcribe_fn,
-            events=raw_events,
-            stop_event=stop_event,
-            chunk_interval_sec=cfg.asr.chunk_interval_sec,
-            min_audio_sec=cfg.asr.min_audio_sec,
-            commit_safety_margin_sec=cfg.asr.commit_safety_margin_sec,
-            max_buffer_sec=cfg.asr.max_buffer_sec,
-            force_commit_keep_tail_words=cfg.asr.force_commit_keep_tail_words,
-            silence_rms_threshold=cfg.asr.filters.silence_rms_threshold,
-            empty_decodes_before_trim=cfg.asr.filters.empty_decodes_before_trim,
-            silence_keep_tail_sec=cfg.asr.filters.silence_keep_tail_sec,
             latency=latency,
+            on_status=overlay.post_status,
         )
+        backend.load()
         if stop_event.is_set():  # app closed while the model was loading
             return
         pipeline.engine_thread = threading.Thread(
-            target=engine.run, name="engine", daemon=True
+            target=backend.run,
+            kwargs={"events": raw_events, "stop_event": stop_event},
+            name="engine",
+            daemon=True,
         )
         pipeline.engine_thread.start()
         overlay.post_status("")

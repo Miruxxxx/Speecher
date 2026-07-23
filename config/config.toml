@@ -10,6 +10,7 @@ max_channels = 2
 restart_backoff_sec = 2.0     # пауза перед перезапуском упавшего capture-процесса
 
 [asr]
+engine = "whisper"             # движок распознавания; неизвестное значение → whisper
 # tiny/base/small/medium/large-v3, либо полный HF repo id.
 # large-v3-turbo указан явным репозиторием: короткий алиас в faster-whisper 1.2
 # ведёт на dropbox-dash/*, а этот вариант уже лежит в локальном кэше.
