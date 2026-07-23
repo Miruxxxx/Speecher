@@ -82,7 +82,7 @@ class AsrConfig:
 
 @dataclass(slots=True)
 class PunctuationConfig:
-    backend: str = "silero"   # silero | deepmultilingual | off
+    backend: str = "silero"   # silero | off (unknown → off with a warning)
     language: str = "ru"      # silero supports ru/en/de/es
     interval_sec: float = 12.0
     context_words: int = 80

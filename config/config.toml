@@ -50,7 +50,8 @@ lookahead_tokens = 6          # 0 | 3 | 6 | 13 → задержка 80/320/560/1
 language = "auto"             # "auto" | "ru" | "en-US" | ... (локали модели)
 
 [punctuation]
-backend = "silero"            # silero (ru/en/de/es, CPU) | deepmultilingual (en/de/fr/it) | off
+# Работает только при engine = "whisper": nemotron пунктуирует сам.
+backend = "silero"            # silero (ru/en/de/es, CPU) | off
 language = "ru"               # язык для silero
 interval_sec = 12.0
 context_words = 80

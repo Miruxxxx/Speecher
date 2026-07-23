@@ -64,11 +64,11 @@ Shutdown: single shared `stop_event`; overlay close → `app.quit()` → stop_ev
 
 PyAudioWPatch 0.2.12.7 corrupts the heap of its host process after ~2-8 min of an idle loopback stream (0xc0000005 in ntdll; bisected 2026-07-15: capture-only run crashed, whisper-only loop clean over 5438 decodes). Mitigation: process isolation + supervisor restart (see above). History and crash matrix: docs/CODE_REVIEW_2026-07-15.md §B1.
 
-## Second ASR backend (Nemotron) — code done, not installable yet
+## Second ASR backend (Nemotron) — done, off by default
 
-`asr.engine = "whisper" | "nemotron"`; the migration and every measurement live in **docs/MIGRATION_NEMOTRON.md** — read it before touching `nemotron_backend.py`, `streaming_engine.py`, `whisper_adapter.py` or `capture_supervisor.py`. Phases 0–2 are done (2026-07-23): `src/asr/nemotron_backend.py` streams live and was verified on real speech.
+`asr.engine = "whisper" | "nemotron"`; the migration and every measurement live in **docs/MIGRATION_NEMOTRON.md** — read it before touching `nemotron_backend.py`, `streaming_engine.py`, `whisper_adapter.py` or `capture_supervisor.py`. All four phases are done (2026-07-23); `src/asr/nemotron_backend.py` streams live in `.venv` (~0.7 s to a word vs 2.5-3.5 s for whisper).
 
-**It cannot run on the global interpreter**: Nemotron needs a CUDA torch build (cu128 on this Blackwell GPU), the global one is `torch 2.8.0+cpu`. Choosing between a project venv and a global cu128 install is a project-level call — do not make it silently. Until then `engine = "nemotron"` loses to the load-failure path and falls back to Whisper with a status message.
+**Whisper stays the default on purpose**: both engines were only ever measured on synthesized speech (silero TTS, SAPI), and nemotron's open limits — `input_ids` growing linearly inside the one long-lived `generate()`, encoder context surviving a minute of silence, no RMS silence gate — show up on long live sessions, not on 12-second files. Flipping the default needs a real-speech run, not a code change. A backend that fails to load falls back to whisper with a status message.
 
 How the nemotron path differs from whisper (details in the doc):
 

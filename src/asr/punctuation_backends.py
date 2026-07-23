@@ -74,34 +74,11 @@ class SileroBackend:
         return self._model.enhance_text(text.lower(), self._language)
 
 
-class FullstopBackend:
-    """oliverguhr/fullstop-punctuation-multilang-large via
-    deepmultilingualpunctuation. EN/DE/FR/IT only (no Russian), ~2.1 GB.
-    Forced onto CPU: the stock PunctuationModel grabs the GPU whenever CUDA
-    is available and would share VRAM with Whisper."""
-
-    name = "deepmultilingual"
-
-    def __init__(self) -> None:
-        self._model = None
-
-    def load(self) -> None:
-        from transformers import pipeline
-        from deepmultilingualpunctuation import PunctuationModel
-
-        # Skip PunctuationModel.__init__ (it hardcodes device=0 on CUDA);
-        # its only state is `pipe`, which we build ourselves on CPU.
-        model = PunctuationModel.__new__(PunctuationModel)
-        model.pipe = pipeline(
-            "ner",
-            "oliverguhr/fullstop-punctuation-multilang-large",
-            aggregation_strategy=None,
-            device="cpu",
-        )
-        self._model = model
-
-    def restore(self, text: str) -> str:
-        return self._model.restore_punctuation(text)
+# The "deepmultilingual" backend (fullstop-punctuation-multilang-large via
+# deepmultilingualpunctuation) was removed in phase 3 of the Nemotron
+# migration: it has no Russian, cost ~2.1 GB, and its package pulls
+# transformers below the >=5.13 the nemotron engine needs. Configs still
+# naming it fall through to the unknown-backend path (punctuation off).
 
 
 def create_backend(backend: str, language: str) -> Optional[PunctuationBackend]:
@@ -111,7 +88,5 @@ def create_backend(backend: str, language: str) -> Optional[PunctuationBackend]:
         return None
     if kind == "silero":
         return SileroBackend(language=language)
-    if kind == "deepmultilingual":
-        return FullstopBackend()
     logger.warning("unknown punctuation backend %r; punctuation disabled", backend)
     return None

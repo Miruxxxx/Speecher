@@ -9,8 +9,8 @@
 | Слой | Технология |
 |---|---|
 | Захват звука | PyAudioWPatch (WASAPI loopback) **в отдельном подпроцессе** с супервизором и авто-рестартом; soxr (стриминговый ресемплинг → 16 kHz) |
-| ASR | faster-whisper (`large-v3-turbo` по умолчанию, CUDA fp16) + стриминг-движок LocalAgreement-2 с гейтом тишины и фильтрами галлюцинаций |
-| Пунктуация | silero-te (ru/en/de/es, CPU) — по умолчанию; deepmultilingualpunctuation — опция |
+| ASR | два переключаемых движка (`[asr] engine`): **whisper** (по умолчанию) — faster-whisper `large-v3-turbo` на CUDA fp16 + LocalAgreement-2 с гейтом тишины и фильтрами галлюцинаций; **nemotron** — `nvidia/nemotron-3.5-asr-streaming-0.6b`, cache-aware стриминг, ~0.7 с до слова, пунктуация нативная |
+| Пунктуация | silero-te (ru/en/de/es, CPU) — только для движка whisper; nemotron пунктуирует сам |
 | LLM | LM Studio через OpenAI-совместимый REST (`localhost:1234`) |
 | UI | PyQt6 — прозрачный frameless-оверлей + консольный вывод |
 
@@ -19,9 +19,13 @@ Python 3.11, только Windows (WASAPI loopback).
 ## Установка
 
 ```powershell
-pip install -r requirements.txt
-# torch с CUDA не обязателен: пунктуация работает на CPU.
+python -m venv .venv
+.venv\Scripts\python -m pip install torch --index-url https://download.pytorch.org/whl/cu128
+.venv\Scripts\python -m pip install -r requirements.txt
 ```
+
+torch ставится первым и отдельным индексом: с PyPI приедет `+cpu`, и движок
+nemotron работать не будет (подробности — в шапке `requirements.txt`).
 
 Требования:
 - NVIDIA GPU + драйвер для faster-whisper на CUDA (либо `device = "cpu"` + `compute_type = "int8"` в конфиге — медленнее).
@@ -39,12 +43,14 @@ python -m src
 Все настройки — в [config/config.toml](config/config.toml) (файл можно удалить — приложение запустится на дефолтах). Ключевое:
 
 - `[audio] device_hint` — подстрока имени устройства вывода, чей loopback слушаем (`"HyperX"`).
+- `[asr] engine` — `whisper` (по умолчанию) или `nemotron`; неизвестное значение → `whisper` с предупреждением. Ключи ниже относятся к whisper-пути.
+- `[asr.nemotron]` — читается только при `engine = "nemotron"`: модель, `dtype` (`float32` по умолчанию — fp16 экономит VRAM, но декодирует вдвое медленнее), `lookahead_tokens` `0/3/6/13` → задержка 80/320/560/1120 мс.
 - `[asr] model / device / language` — модель Whisper, cuda/cpu и режим языка:
   - `"auto"` — определить по первой уверенной речи и зафиксировать (по умолчанию);
   - `"ru"`, `"en"`, … — жёстко;
   - `""` — переопределять каждый цикл (не рекомендуется: даёт «кашу» алфавитов).
 - `[asr.filters]` — пороги отбраковки галлюцинаций (`no_speech_prob`, `avg_logprob`), схлопывание повторов, гейт тишины.
-- `[punctuation] backend` — `silero` (ru/en/de/es, CPU) / `deepmultilingual` (en/de/fr/it) / `off`.
+- `[punctuation] backend` — `silero` (ru/en/de/es, CPU) / `off`. При `engine = "nemotron"` воркер не запускается вообще.
 - `[llm]` — URL LM Studio, таймауты; `model = ""` берёт первую загруженную в LM Studio модель.
 
 ## Управление оверлеем
@@ -68,10 +74,13 @@ src/
     buffer.py              # GrowingAudioBuffer: append-only + head-trim
     devices.py             # выбор loopback-устройства по подстроке имени
   asr/
+    backends.py            # протокол ASRBackend + выбор движка по [asr] engine
+    whisper_backend.py     # pull-путь: снапшоты буфера → StreamingASREngine
     streaming_engine.py    # LocalAgreement-2 + гейт тишины (поток engine)
     whisper_adapter.py     # faster-whisper → Word[]; sticky-язык, фильтры галлюцинаций
-    punctuation_backends.py# silero-te | fullstop (CPU) | off
-    punctuation_worker.py  # фоновая пере-пунктуация хвоста транскрипта
+    nemotron_backend.py    # push-путь: фреймы из frame_sink → стриминговый RNN-T
+    punctuation_backends.py# silero-te (CPU) | off
+    punctuation_worker.py  # фоновая пере-пунктуация хвоста транскрипта (только whisper)
     events.py              # ASREvent (commit/partial/log/fatal), Word
   store/
     transcript_store.py    # потокобезопасный стор слов + запросы (вопрос/период)

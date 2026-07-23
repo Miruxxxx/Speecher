@@ -33,3 +33,10 @@ def test_create_backend_silero():
 
 def test_create_backend_unknown_returns_none():
     assert create_backend("bogus", "ru") is None
+
+
+def test_create_backend_deepmultilingual_is_gone():
+    # Removed in phase 3 (no Russian, and its package drags transformers below
+    # the >=5.13 nemotron needs). An old config naming it must degrade to
+    # "punctuation off", not crash.
+    assert create_backend("deepmultilingual", "ru") is None

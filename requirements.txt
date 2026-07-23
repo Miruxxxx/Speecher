@@ -28,9 +28,8 @@ accelerate>=1.14
 # --- Пунктуация (config: [punctuation].backend) ---
 # silero (дефолт): torch + модель ~50 MB через torch.hub при первом запуске.
 # Работает только для engine = "whisper" — nemotron пунктуирует сам.
-# Бэкенд deepmultilingual в venv НЕ ставится намеренно: он не поддерживает
-# русский, а его пакет умеет утащить transformers ниже 5.13 и сломать
-# nemotron. Нужен — ставить руками и проверять версию transformers после.
+# Второго бэкенда больше нет: deepmultilingualpunctuation удалён в фазе 3
+# (нет русского, ~2.1 ГБ, тянет transformers ниже 5.13 и ломает nemotron).
 
 # --- Dev ---
 pytest>=8.0
