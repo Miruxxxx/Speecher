@@ -65,6 +65,59 @@ def test_bad_tunables_report_fatal_instead_of_dying():
 # -- capture_supervisor frame_sink ---------------------------------------
 
 
+# -- nemotron WordAssembler: late punctuation -----------------------------
+
+
+def _words(items):
+    """Feed (piece, frame) pairs, return (emitted word texts, late puncts)."""
+    from asr.nemotron_backend import WordAssembler
+
+    late: list[str] = []
+    a = WordAssembler(0.08, on_late_punct=late.append)
+    out = []
+    for piece, frame in items:
+        out += a.push(piece, frame)
+    out += a.flush()
+    return [w.text for w in out], late
+
+
+def test_punctuation_attaches_when_word_still_open():
+    # '.' arrives before the next word's leading space -> sticks to the word.
+    texts, late = _words([(" встреча", 10), ("?", 10), (" Да", 12)])
+    assert texts[0] == "встреча?"
+    assert late == []
+
+
+def test_late_punctuation_after_flush_is_reported_not_dropped():
+    from asr.nemotron_backend import WordAssembler
+
+    late: list[str] = []
+    a = WordAssembler(0.08, idle_flush_sec=2.0, on_late_punct=late.append)
+
+    out = a.push(" встреча", 100)
+    assert out == []
+    # A pause: 25+ blank frames close the word before the '?' is emitted.
+    for f in range(101, 135):
+        out += a.advance(f)
+    assert [w.text for w in out] == ["встреча"]  # committed without the mark
+
+    # The late '?' now has no word to attach to -> surfaced as late punctuation.
+    assert a.push("?", 128) == []
+    assert late == ["?"]
+
+
+def test_append_to_last_word_amends_in_place():
+    from asr.events import Word
+    from store.transcript_store import TranscriptStore
+
+    store = TranscriptStore()
+    store.append([Word("привет", 0.0, 0.3), Word("встреча", 0.4, 0.8)])
+    store.append_to_last_word("?")
+
+    assert store.all_text() == "привет встреча?"
+    assert store.size() == 2  # no new entry, indices intact
+
+
 def _supervisor(**kwargs) -> CaptureSupervisor:
     return CaptureSupervisor(
         audio_buffer=GrowingAudioBuffer(sample_rate=16000),

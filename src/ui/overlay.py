@@ -275,6 +275,11 @@ class Overlay(QWidget):
         elif ev.type == "partial":
             self._partial = ev.text
             self._refresh_transcript()
+        elif ev.type == "amend":
+            # The splitter already appended the punctuation to the last word
+            # in the store; just re-render so it shows without waiting for the
+            # repaint timer.
+            self._refresh_transcript()
         elif ev.type == "fatal":
             # Show the reason before the app tears down. main's shutdown timer
             # defers to fatal_active() so the process doesn't quit underneath

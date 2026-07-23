@@ -39,7 +39,8 @@ def _run_splitter(
 
     Commits are also appended to the TranscriptStore *here*, so the store
     (the source of truth for summaries/questions) never loses words to a
-    full UI queue — sinks only render.
+    full UI queue — sinks only render. Amend events mutate the store's last
+    word in the same in-order pass (nemotron's late punctuation).
     """
     while not stop_event.is_set():
         try:
@@ -48,6 +49,11 @@ def _run_splitter(
             continue
         if ev.type == "commit":
             store.append(ev.words)
+        elif ev.type == "amend":
+            # Late punctuation for a word already committed. Applied here (in
+            # queue order, so the word is in the store first) rather than in
+            # the overlay, keeping the store the single source of truth.
+            store.append_to_last_word(ev.text)
         for q in sinks:
             try:
                 q.put_nowait(ev)

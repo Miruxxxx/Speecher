@@ -60,10 +60,20 @@ class WordAssembler:
     emits a token at a frame, not over a span.
     """
 
-    def __init__(self, frame_sec: float, idle_flush_sec: float = IDLE_FLUSH_SEC) -> None:
+    def __init__(
+        self,
+        frame_sec: float,
+        idle_flush_sec: float = IDLE_FLUSH_SEC,
+        on_late_punct: Optional[Callable[[str], None]] = None,
+    ) -> None:
         self._frame_sec = float(frame_sec)
         self._idle_frames = max(1, int(round(idle_flush_sec / self._frame_sec)))
         self._pending: Optional[_Pending] = None
+        # Called with punctuation that arrived after its word was already
+        # committed (this model emits sentence-final '.'/'?' ~1.5 s late, after
+        # the pause an idle/stale flush has already acted on). The backend
+        # turns it into an `amend` event instead of dropping it.
+        self._on_late_punct = on_late_punct
 
     def push(self, piece: str, frame: int) -> List[Word]:
         """Feed one decoded token piece. Returns the words it completed."""
@@ -82,9 +92,12 @@ class WordAssembler:
             self._pending = None
             return done
         if self._pending is None and not opens_word and not _has_content(text):
-            # Punctuation for a word that an idle flush already committed
-            # (the model emits it only after hearing the pause). It cannot be
-            # attached any more, and on its own it is not a word.
+            # Punctuation for a word that an idle/stale flush already committed
+            # (the model emits it only after hearing the pause). The word is
+            # gone from here, so hand the punctuation to the backend to append
+            # onto the last committed word instead of dropping it.
+            if self._on_late_punct is not None:
+                self._on_late_punct(text)
             return done
         if opens_word or self._pending is None:
             self._pending = _Pending(text=text, start_frame=frame, end_frame=frame)
@@ -217,7 +230,10 @@ class NemotronBackend:
         try:
             import torch
 
-            assembler = WordAssembler(self._frame_sec)
+            assembler = WordAssembler(
+                self._frame_sec,
+                on_late_punct=lambda punct: self._amend(events, punct),
+            )
             streamer = _WordStreamer(
                 model=self._model,
                 processor=self._processor,
@@ -311,6 +327,20 @@ class NemotronBackend:
             events.put(ASREvent(type="commit", source="engine", text=text, words=words), timeout=0.5)
         except queue.Full:
             self._emit_log(events, "event queue full on commit; dropped")
+
+    def _amend(self, events: "queue.Queue[ASREvent]", punct: str) -> None:
+        """Append late punctuation to the last committed word.
+
+        Emitted through the same queue as commits, so the splitter applies it
+        after the word it belongs to is already in the store.
+        """
+        punct = punct.strip()
+        if not punct:
+            return
+        try:
+            events.put(ASREvent(type="amend", source="engine", text=punct), timeout=0.5)
+        except queue.Full:
+            self._emit_log(events, "event queue full on amend; dropped")
 
     def _status(self, msg: str) -> None:
         if self._on_status is not None:

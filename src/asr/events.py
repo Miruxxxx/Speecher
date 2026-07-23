@@ -4,7 +4,7 @@ from dataclasses import dataclass, field
 from typing import List, Literal
 
 
-ASREventType = Literal["commit", "partial", "log", "fatal"]
+ASREventType = Literal["commit", "partial", "amend", "log", "fatal"]
 
 
 @dataclass(slots=True, frozen=True)
@@ -23,6 +23,9 @@ class ASREvent:
 
       commit  -> these words have been confirmed and will not change
       partial -> live preview, will be replaced on the next event
+      amend   -> append `text` to the last committed word in place (used by
+                 the nemotron backend for punctuation the model emits after
+                 the word was already committed; does not shift word indices)
       log     -> informational
       fatal   -> unrecoverable error; should trigger shutdown
     """

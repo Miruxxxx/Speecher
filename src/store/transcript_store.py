@@ -74,6 +74,25 @@ class TranscriptStore:
             start = max(0, total - n_words)
             return start, [e[0] for e in self._entries[start:]]
 
+    def append_to_last_word(self, suffix: str) -> None:
+        """Append `suffix` to the most recent word's text in place.
+
+        For punctuation the model emits only after the word was already
+        committed (nemotron's terminal '.'/'?'). Keeps the entry count and
+        every index unchanged, so it is safe for the same reasons
+        `update_word_texts` is.
+        """
+        if not suffix:
+            return
+        with self._lock:
+            if not self._entries:
+                return
+            old_word, ts = self._entries[-1]
+            self._entries[-1] = (
+                Word(text=old_word.text + suffix, start=old_word.start, end=old_word.end),
+                ts,
+            )
+
     def update_word_texts(self, start_index: int, new_texts: list[str]) -> None:
         with self._lock:
             if start_index + len(new_texts) > len(self._entries):

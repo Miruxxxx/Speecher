@@ -76,6 +76,7 @@ How the nemotron path differs from whisper (details in the doc):
 - Streaming `generate()` is **one long-lived call** that pulls mel chunks from a generator and blocks in silence. Live output comes only from `streamer=`, so `durations` never arrive — `_WordStreamer` reproduces the encoder-frame counter (blank advances a frame) to get global timestamps.
 - Output is append-only: no `partial` events, no LocalAgreement-2, no `GrowingAudioBuffer`, and `PunctuationWorker` is not started (punctuation is native — `main.py` logs that).
 - Words are closed by the *next* word's leading space, plus two flush rules (`IDLE_FLUSH_SEC` in stream frames, `STALE_FLUSH_SEC` in wall clock). Sentence-final punctuation lands ~1.5 s late, so closing a word earlier would split "встреча?" in two.
+- That ~1.5 s lateness still races the flush rules: when the word is committed before its `.`/`?` arrives, the punctuation would be lost. `WordAssembler(on_late_punct=...)` catches it and the backend emits an **`amend`** event; `_run_splitter` appends it to the store's last word in place (`TranscriptStore.append_to_last_word`) — the same append-only, index-stable edit the whisper `PunctuationWorker` uses. Without this the overlay showed no punctuation at all on live speech.
 
 ## Conventions
 
