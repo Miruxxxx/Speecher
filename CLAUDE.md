@@ -6,7 +6,7 @@ Speecher — Windows-only real-time transcription of **system audio** (WASAPI lo
 
 ```powershell
 python -m src            # run the app (overlay window; models load in background)
-python -m pytest tests/  # unit tests, no GPU/audio needed (43 tests)
+python -m pytest tests/  # unit tests, no GPU/audio needed (58 tests)
 python scripts/list_audio_devices.py  # enumerate WASAPI loopback devices
 ```
 
@@ -20,12 +20,14 @@ All tunables live in `config/config.toml` (loaded by `src/app_config.py` over da
                                          heap on idle loopback streams — §B1 —
                                          so it lives in a disposable process)
 [capture-supervisor thread] audio/capture_supervisor.py: pumps the queue,
-      stereo→mono, stateful soxr resample →16kHz → GrowingAudioBuffer;
+      stereo→mono, stateful soxr resample →16kHz → GrowingAudioBuffer
+      (+ optional frame_sink queue for a push-style backend, drop-on-full);
       restarts dead children (backoff; 3 fast fails in a row → fatal)
-[engine thread]  StreamingASREngine: every 1s snapshot buffer → WhisperAdapter
-                 (faster-whisper large-v3-turbo CUDA fp16 by default) →
-                 LocalAgreement-2 commit/partial; silence: RMS gate skips
-                 decodes, N empty decodes → trim buffer to short tail
+[engine thread]  the ASRBackend picked by asr.engine runs its own loop here.
+                 whisper (default): WhisperBackend → StreamingASREngine, every
+                 1s snapshot buffer → WhisperAdapter (faster-whisper
+                 large-v3-turbo CUDA fp16) → LocalAgreement-2 commit/partial;
+                 silence: RMS gate skips decodes, N empty → trim to short tail
 [splitter thread] fans raw_events out to sink_events + overlay_events;
                  appends commit words to TranscriptStore (store is the source
                  of truth — a dropped UI event can't lose transcript data)
@@ -56,6 +58,14 @@ Shutdown: single shared `stop_event`; overlay close → `app.quit()` → stop_ev
 ## Known issue (mitigated, root cause external)
 
 PyAudioWPatch 0.2.12.7 corrupts the heap of its host process after ~2-8 min of an idle loopback stream (0xc0000005 in ntdll; bisected 2026-07-15: capture-only run crashed, whisper-only loop clean over 5438 decodes). Mitigation: process isolation + supervisor restart (see above). History and crash matrix: docs/CODE_REVIEW_2026-07-15.md §B1.
+
+## Planned: second ASR backend (Nemotron)
+
+Migration to a switchable ASR engine (`asr.engine = "whisper" | "nemotron"`) is specified in **docs/MIGRATION_NEMOTRON.md** — read it before touching `streaming_engine.py`, `whisper_adapter.py`, or `capture_supervisor.py`. Status: **phases 0 and 1 done, phase 2 unblocked**. The `ASRBackend` protocol (`src/asr/backends.py`), `WhisperBackend`, `asr.engine` config key and the supervisor's `frame_sink` exist; `"whisper"` is the only known engine and anything else falls back to it with a warning.
+
+Phase-0 probe (2026-07-23) settled the open questions: `nemo_toolkit` is **not** needed (`transformers` ≥5.13 with `AutoModelForRNNT`/`AutoProcessor`, plus the undocumented-but-required `librosa` and `accelerate`); word timestamps **are** available via `processor.decode(sequences, durations=out.durations)` at an 80 ms encoder frame, and stay global across streaming chunks (so no `offset_sec` bookkeeping); output is append-only, so the Nemotron path needs no `partial` events and no LocalAgreement-2. Caveats: `Word.end` is an emission point (+80 ms), not the acoustic end; fp16 halves VRAM but decodes ~2x slower than fp32; Russian output omits "?", which `find_last_question` depends on.
+
+Environment gotcha for phase 2: the global interpreter has `torch 2.8.0+cpu`, but Nemotron needs a CUDA build (cu128 on this Blackwell GPU). Deciding between a project venv and a global cu128 install is a project-level call — do not make it silently inside phase 2.
 
 ## Conventions
 
