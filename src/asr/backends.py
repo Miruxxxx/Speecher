@@ -46,13 +46,36 @@ def create_asr_backend(
     audio_buffer,
     latency=None,
     on_status: Optional[StatusFn] = None,
+    frame_sink=None,
+    engine: Optional[str] = None,
 ) -> ASRBackend:
-    """Pick a backend by `asr.engine`. Unknown names fall back to Whisper."""
+    """Pick a backend by `asr.engine`. Unknown names fall back to Whisper.
+
+    `engine` overrides the config, which is how main.py retries with Whisper
+    after another backend failed to load.
+    """
     from asr.whisper_backend import WhisperBackend  # local: keeps imports flat
 
-    engine = (cfg.asr.engine or "").strip().lower()
-    if engine != "whisper":
+    name = (engine if engine is not None else cfg.asr.engine or "").strip().lower()
+
+    if name == "nemotron":
+        if frame_sink is None:
+            # The supervisor only forwards frames when it was given the queue;
+            # without it this backend would sit on silence forever.
+            logger.warning("asr.engine='nemotron' needs a frame_sink; using 'whisper'")
+        else:
+            from asr.nemotron_backend import NemotronBackend
+
+            logger.info("ASR backend: nemotron")
+            return NemotronBackend(
+                cfg=cfg.asr.nemotron,
+                frame_sink=frame_sink,
+                latency=latency,
+                on_status=on_status,
+            )
+    elif name != "whisper":
         logger.warning("asr.engine=%r is not available; using 'whisper'", cfg.asr.engine)
+
     logger.info("ASR backend: whisper")
     return WhisperBackend(
         cfg=cfg.asr, audio_buffer=audio_buffer, latency=latency, on_status=on_status

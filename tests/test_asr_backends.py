@@ -24,14 +24,14 @@ def test_default_engine_is_whisper():
 
 
 def test_unknown_engine_falls_back_to_whisper():
-    b = _backend("nemotron")
+    b = _backend("vosk")
     assert isinstance(b, WhisperBackend)
     assert b.name == "whisper"
 
 
 def test_config_normalizes_unknown_engine(tmp_path: Path):
     p = tmp_path / "config.toml"
-    p.write_text('[asr]\nengine = "Nemotron"\n', encoding="utf-8")
+    p.write_text('[asr]\nengine = "Vosk"\n', encoding="utf-8")
     assert load_config(p).asr.engine == "whisper"
 
 

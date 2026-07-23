@@ -1,8 +1,14 @@
-# Speecher — проверенные версии (Python 3.11, Windows).
-# ВАЖНО: faster-whisper на CUDA требует NVIDIA driver + cuBLAS/cuDNN 9
-# (ctranslate2 тянет их сам через pip-зависимости).
-# torch с CUDA ставится отдельным индексом:
-#   pip install torch --index-url https://download.pytorch.org/whl/cu128
+# Speecher — проверенные версии (Python 3.11, Windows, venv в .venv).
+#
+# Установка с нуля:
+#   python -m venv .venv
+#   .venv\Scripts\python -m pip install torch --index-url https://download.pytorch.org/whl/cu128
+#   .venv\Scripts\python -m pip install -r requirements.txt
+#
+# ВАЖНО: torch ставится ПЕРВЫМ и отдельным индексом (cu128 — сборка под
+# Blackwell). С PyPI приедет +cpu, и движок nemotron работать не будет.
+# faster-whisper на CUDA требует NVIDIA driver + cuBLAS/cuDNN 9 —
+# ctranslate2 тянет их сам через pip-зависимости.
 
 faster-whisper>=1.2.1
 PyAudioWPatch>=0.2.12.7
@@ -10,13 +16,21 @@ PyQt6>=6.11.0
 numpy>=2.3
 soxr>=1.0             # стриминговый ресемплер с состоянием
 openai>=2.34          # клиент для LM Studio (OpenAI-совместимый REST)
+torch>=2.11           # CUDA-сборка, см. шапку
+
+# --- ASR-движок nemotron (config: [asr].engine = "nemotron") ---
+# transformers дают AutoModelForRNNT/AutoProcessor; librosa и accelerate
+# обязательны, но в карточке модели не указаны.
+transformers>=5.13
+librosa>=0.11
+accelerate>=1.14
 
 # --- Пунктуация (config: [punctuation].backend) ---
 # silero (дефолт): torch + модель ~50 MB через torch.hub при первом запуске.
-# deepmultilingual: + transformers; модель ~2.1 GB с HuggingFace (EN/DE/FR/IT).
-torch>=2.8
-deepmultilingualpunctuation>=1.0.1
-transformers>=5.0
+# Работает только для engine = "whisper" — nemotron пунктуирует сам.
+# Бэкенд deepmultilingual в venv НЕ ставится намеренно: он не поддерживает
+# русский, а его пакет умеет утащить transformers ниже 5.13 и сломать
+# nemotron. Нужен — ставить руками и проверять версию transformers после.
 
 # --- Dev ---
 pytest>=8.0

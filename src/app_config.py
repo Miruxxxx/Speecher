@@ -10,7 +10,12 @@ logger = logging.getLogger(__name__)
 
 # Backends `create_asr_backend` knows how to build. Anything else falls back
 # to "whisper" with a warning instead of crashing at startup.
-KNOWN_ASR_ENGINES = ("whisper",)
+KNOWN_ASR_ENGINES = ("whisper", "nemotron")
+
+# Right attention contexts the Nemotron checkpoint was trained with, in
+# subsampled encoder frames. Latency is (n + 1) * 80 ms.
+NEMOTRON_LOOKAHEAD_TOKENS = (0, 3, 6, 13)
+NEMOTRON_DTYPES = ("float32", "float16", "bfloat16")
 
 
 @dataclass(slots=True)
@@ -37,6 +42,22 @@ class AsrFiltersConfig:
 
 
 @dataclass(slots=True)
+class NemotronConfig:
+    """Settings for the `nemotron` engine (src/asr/nemotron_backend.py)."""
+
+    model: str = "nvidia/nemotron-3.5-asr-streaming-0.6b"
+    device: str = "cuda"            # cuda | cpu
+    # float32 by default on purpose: fp16 halves VRAM but decodes ~2x slower
+    # (greedy RNN-T is a loop over frames, conversion overhead dominates).
+    dtype: str = "float32"          # float32 | float16 | bfloat16
+    # Right attention context; latency is (n + 1) * 80 ms.
+    lookahead_tokens: int = 6
+    # "auto" lets the model detect the language per stream; a locale ("ru",
+    # "en-US", ...) pins the prompt. Unknown values raise at load().
+    language: str = "auto"
+
+
+@dataclass(slots=True)
 class AsrConfig:
     # Which ASR backend runs the recognition loop (see src/asr/backends.py).
     engine: str = "whisper"
@@ -56,6 +77,7 @@ class AsrConfig:
     force_commit_keep_tail_words: int = 6
     buffer_max_seconds: float = 60.0
     filters: AsrFiltersConfig = field(default_factory=AsrFiltersConfig)
+    nemotron: NemotronConfig = field(default_factory=NemotronConfig)
 
 
 @dataclass(slots=True)
@@ -148,3 +170,19 @@ def _normalize(cfg: AppConfig) -> None:
         )
         engine = "whisper"
     cfg.asr.engine = engine
+
+    nem = cfg.asr.nemotron
+    if nem.lookahead_tokens not in NEMOTRON_LOOKAHEAD_TOKENS:
+        logger.warning(
+            "config: asr.nemotron.lookahead_tokens=%r is not supported (allowed: %s); using 6",
+            nem.lookahead_tokens, ", ".join(str(v) for v in NEMOTRON_LOOKAHEAD_TOKENS),
+        )
+        nem.lookahead_tokens = 6
+    dtype = nem.dtype.strip().lower()
+    if dtype not in NEMOTRON_DTYPES:
+        logger.warning(
+            "config: asr.nemotron.dtype=%r is unknown (allowed: %s); using 'float32'",
+            nem.dtype, ", ".join(NEMOTRON_DTYPES),
+        )
+        dtype = "float32"
+    nem.dtype = dtype

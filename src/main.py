@@ -73,6 +73,7 @@ def _load_asr_pipeline(
     latency: LatencyTracker,
     overlay: Overlay,
     pipeline: _Pipeline,
+    frame_sink: "queue.Queue | None" = None,
 ) -> None:
     """Loads the ASR backend and starts its loop. Runs in a background thread
     so the overlay window is interactive from the first second."""
@@ -82,8 +83,25 @@ def _load_asr_pipeline(
             audio_buffer=audio_buffer,
             latency=latency,
             on_status=overlay.post_status,
+            frame_sink=frame_sink,
         )
-        backend.load()
+        try:
+            backend.load()
+        except Exception as exc:
+            if backend.name == "whisper":
+                raise
+            # A second engine that won't load is a config/environment problem,
+            # not a reason to leave the user without transcription.
+            logger.exception("%s backend failed to load; falling back to whisper", backend.name)
+            overlay.post_status(f"{backend.name} не загрузился ({exc}); включаю Whisper…")
+            backend = create_asr_backend(
+                cfg,
+                audio_buffer=audio_buffer,
+                latency=latency,
+                on_status=overlay.post_status,
+                engine="whisper",
+            )
+            backend.load()
         if stop_event.is_set():  # app closed while the model was loading
             return
         pipeline.engine_thread = threading.Thread(
@@ -94,7 +112,8 @@ def _load_asr_pipeline(
         )
         pipeline.engine_thread.start()
         overlay.post_status("")
-        logger.info("ASR engine started (model=%s)", cfg.asr.model)
+        model = cfg.asr.nemotron.model if backend.name == "nemotron" else cfg.asr.model
+        logger.info("ASR engine started (backend=%s, model=%s)", backend.name, model)
     except Exception as exc:
         logger.exception("ASR pipeline failed to load")
         overlay.post_status(f"Ошибка загрузки ASR: {exc}")
@@ -121,6 +140,12 @@ def main() -> None:
     )
     store = TranscriptStore()
 
+    # Push-style backends read frames as they arrive; the pull-style whisper
+    # path takes snapshots of audio_buffer and wants no queue at all.
+    frame_sink: "queue.Queue | None" = (
+        queue.Queue(maxsize=256) if cfg.asr.engine == "nemotron" else None
+    )
+
     capture = CaptureSupervisor(
         audio_buffer=audio_buffer,
         device_hint=cfg.audio.device_hint,
@@ -131,6 +156,7 @@ def main() -> None:
         max_channels=cfg.audio.max_channels,
         restart_backoff_sec=cfg.audio.restart_backoff_sec,
         latency=latency,
+        frame_sink=frame_sink,
     )
 
     sink = OutputSink(
@@ -191,14 +217,20 @@ def main() -> None:
     pipeline = _Pipeline()
     loader_thread = threading.Thread(
         target=_load_asr_pipeline,
-        args=(cfg, audio_buffer, raw_events, stop_event, latency, overlay, pipeline),
+        args=(cfg, audio_buffer, raw_events, stop_event, latency, overlay, pipeline, frame_sink),
         name="asr-loader",
         daemon=True,
     )
     loader_thread.start()
 
     punct_thread: threading.Thread | None = None
-    punct_backend = create_backend(cfg.punctuation.backend, cfg.punctuation.language)
+    punct_backend = None
+    if cfg.asr.engine == "nemotron":
+        # Nemotron punctuates and cases its own output; re-punctuating it would
+        # only fight the model. Logged so it doesn't read as a broken feature.
+        logger.info("punctuation worker disabled: engine=nemotron punctuates natively")
+    else:
+        punct_backend = create_backend(cfg.punctuation.backend, cfg.punctuation.language)
     if punct_backend is not None:
         worker = PunctuationWorker(
             store=store,

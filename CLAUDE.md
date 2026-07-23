@@ -1,16 +1,18 @@
 # CLAUDE.md
 
-Speecher — Windows-only real-time transcription of **system audio** (WASAPI loopback) with a PyQt6 always-on-top overlay and LM Studio (local LLM) integration. Python 3.11, global interpreter (no venv). User's language: Russian.
+Speecher — Windows-only real-time transcription of **system audio** (WASAPI loopback) with a PyQt6 always-on-top overlay and LM Studio (local LLM) integration. Python 3.11, project venv in `.venv` (gitignored). User's language: Russian.
 
 ## Run / test
 
 ```powershell
-python -m src            # run the app (overlay window; models load in background)
-python -m pytest tests/  # unit tests, no GPU/audio needed (58 tests)
-python scripts/list_audio_devices.py  # enumerate WASAPI loopback devices
+.venv\Scripts\python -m src            # run the app (overlay window; models load in background)
+.venv\Scripts\python -m pytest tests/  # unit tests, no GPU/audio needed (80 tests)
+.venv\Scripts\python scripts\list_audio_devices.py  # enumerate WASAPI loopback devices
 ```
 
-All tunables live in `config/config.toml` (loaded by `src/app_config.py` over dataclass defaults; missing file/keys → defaults). No CI, no venv, no pyproject.
+The venv exists because the nemotron backend needs a CUDA torch build (cu128) while the global interpreter is on `torch 2.8.0+cpu` — see docs/MIGRATION_NEMOTRON.md. The global interpreter is no longer the project's runtime; anything installed there is unrelated.
+
+All tunables live in `config/config.toml` (loaded by `src/app_config.py` over dataclass defaults; missing file/keys → defaults). No CI, no pyproject.
 
 ## Architecture (data flow)
 
@@ -28,6 +30,9 @@ All tunables live in `config/config.toml` (loaded by `src/app_config.py` over da
                  1s snapshot buffer → WhisperAdapter (faster-whisper
                  large-v3-turbo CUDA fp16) → LocalAgreement-2 commit/partial;
                  silence: RMS gate skips decodes, N empty → trim to short tail
+                 nemotron: NemotronBackend pulls frames from frame_sink, cuts
+                 fixed-size mel chunks, feeds one long-lived generate() and
+                 emits commit-only words from its streamer (no partials)
 [splitter thread] fans raw_events out to sink_events + overlay_events;
                  appends commit words to TranscriptStore (store is the source
                  of truth — a dropped UI event can't lose transcript data)
@@ -59,13 +64,18 @@ Shutdown: single shared `stop_event`; overlay close → `app.quit()` → stop_ev
 
 PyAudioWPatch 0.2.12.7 corrupts the heap of its host process after ~2-8 min of an idle loopback stream (0xc0000005 in ntdll; bisected 2026-07-15: capture-only run crashed, whisper-only loop clean over 5438 decodes). Mitigation: process isolation + supervisor restart (see above). History and crash matrix: docs/CODE_REVIEW_2026-07-15.md §B1.
 
-## Planned: second ASR backend (Nemotron)
+## Second ASR backend (Nemotron) — code done, not installable yet
 
-Migration to a switchable ASR engine (`asr.engine = "whisper" | "nemotron"`) is specified in **docs/MIGRATION_NEMOTRON.md** — read it before touching `streaming_engine.py`, `whisper_adapter.py`, or `capture_supervisor.py`. Status: **phases 0 and 1 done, phase 2 unblocked**. The `ASRBackend` protocol (`src/asr/backends.py`), `WhisperBackend`, `asr.engine` config key and the supervisor's `frame_sink` exist; `"whisper"` is the only known engine and anything else falls back to it with a warning.
+`asr.engine = "whisper" | "nemotron"`; the migration and every measurement live in **docs/MIGRATION_NEMOTRON.md** — read it before touching `nemotron_backend.py`, `streaming_engine.py`, `whisper_adapter.py` or `capture_supervisor.py`. Phases 0–2 are done (2026-07-23): `src/asr/nemotron_backend.py` streams live and was verified on real speech.
 
-Phase-0 probe (2026-07-23) settled the open questions: `nemo_toolkit` is **not** needed (`transformers` ≥5.13 with `AutoModelForRNNT`/`AutoProcessor`, plus the undocumented-but-required `librosa` and `accelerate`); word timestamps **are** available via `processor.decode(sequences, durations=out.durations)` at an 80 ms encoder frame, and stay global across streaming chunks (so no `offset_sec` bookkeeping); output is append-only, so the Nemotron path needs no `partial` events and no LocalAgreement-2. Caveats: `Word.end` is an emission point (+80 ms), not the acoustic end; fp16 halves VRAM but decodes ~2x slower than fp32; Russian output omits "?", which `find_last_question` depends on.
+**It cannot run on the global interpreter**: Nemotron needs a CUDA torch build (cu128 on this Blackwell GPU), the global one is `torch 2.8.0+cpu`. Choosing between a project venv and a global cu128 install is a project-level call — do not make it silently. Until then `engine = "nemotron"` loses to the load-failure path and falls back to Whisper with a status message.
 
-Environment gotcha for phase 2: the global interpreter has `torch 2.8.0+cpu`, but Nemotron needs a CUDA build (cu128 on this Blackwell GPU). Deciding between a project venv and a global cu128 install is a project-level call — do not make it silently inside phase 2.
+How the nemotron path differs from whisper (details in the doc):
+
+- Push, not pull: `CaptureSupervisor(frame_sink=...)` feeds a queue; `main.py` creates that queue only for this engine.
+- Streaming `generate()` is **one long-lived call** that pulls mel chunks from a generator and blocks in silence. Live output comes only from `streamer=`, so `durations` never arrive — `_WordStreamer` reproduces the encoder-frame counter (blank advances a frame) to get global timestamps.
+- Output is append-only: no `partial` events, no LocalAgreement-2, no `GrowingAudioBuffer`, and `PunctuationWorker` is not started (punctuation is native — `main.py` logs that).
+- Words are closed by the *next* word's leading space, plus two flush rules (`IDLE_FLUSH_SEC` in stream frames, `STALE_FLUSH_SEC` in wall clock). Sentence-final punctuation lands ~1.5 s late, so closing a word earlier would split "встреча?" in two.
 
 ## Conventions
 
