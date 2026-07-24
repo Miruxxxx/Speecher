@@ -1,0 +1,9 @@
+[package]
+name = "audio_capture"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+rubato = "4.0.0"
+serde_json = "1.0.151"
+wasapi = "0.23.0"

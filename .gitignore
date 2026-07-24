@@ -6,6 +6,9 @@ __pycache__/
 .venv/
 venv/
 
+# Rust (нативный захват): собирается локально, бинарь в историю не кладём
+native/*/target/
+
 # Visual Studio / VS Code
 .vs/
 .vscode/

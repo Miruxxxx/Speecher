@@ -3,11 +3,18 @@
 # на дефолтах.
 
 [audio]
+# pyaudio (дефолт) | rust — кто захватывает звук.
+# rust = нативный WASAPI-бинарь native/audio_capture (нужен `cargo build
+# --release`), у него нет крэша PortAudio из §B1 и он сам отдаёт моно 16 кГц.
+# Бинаря нет на диске → откат на pyaudio с предупреждением в лог.
+backend = "rust"
 device_hint = "HyperX"        # подстрока имени устройства вывода (loopback)
 target_sample_rate = 16000
-frames_per_buffer = 2048
-max_channels = 2
+frames_per_buffer = 2048      # только pyaudio: rust идёт по периоду WASAPI
+max_channels = 2              # только pyaudio: rust микширует сколько дали
 restart_backoff_sec = 2.0     # пауза перед перезапуском упавшего capture-процесса
+source = "loopback"           # только rust: loopback | mic (задел на двухдорожечный режим)
+rust_binary = ""              # "" = native/audio_capture/target/release/audio_capture.exe
 
 [asr]
 # whisper (дефолт) | nemotron (стриминговый, требует cu128-torch + transformers>=5.13);

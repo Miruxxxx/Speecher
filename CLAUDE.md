@@ -6,8 +6,11 @@ Speecher — Windows-only real-time transcription of **system audio** (WASAPI lo
 
 ```powershell
 .venv\Scripts\python -m src            # run the app (overlay window; models load in background)
-.venv\Scripts\python -m pytest tests/  # unit tests, no GPU/audio needed (80 tests)
-.venv\Scripts\python scripts\list_audio_devices.py  # enumerate WASAPI loopback devices
+.venv\Scripts\python -m pytest tests/  # unit tests, no GPU/audio needed (97 tests)
+.venv\Scripts\python scripts\list_audio_devices.py  # enumerate audio endpoints
+.venv\Scripts\python scripts\capture_soak.py --backend rust --seconds 900  # capture soak test
+cargo build --release --manifest-path native\audio_capture\Cargo.toml  # native capture binary
+cargo test --manifest-path native\audio_capture\Cargo.toml             # its 14 unit tests
 ```
 
 The venv exists because the nemotron backend needs a CUDA torch build (cu128) while the global interpreter is on `torch 2.8.0+cpu` — see docs/MIGRATION_NEMOTRON.md. The global interpreter is no longer the project's runtime; anything installed there is unrelated.
@@ -17,14 +20,20 @@ All tunables live in `config/config.toml` (loaded by `src/app_config.py` over da
 ## Architecture (data flow)
 
 ```
-[capture CHILD PROCESS] audio/capture_process.py: pyaudiowpatch WASAPI loopback
-      raw float32 frames → mp.Queue     (PortAudio corrupts its host process's
-                                         heap on idle loopback streams — §B1 —
-                                         so it lives in a disposable process)
-[capture-supervisor thread] audio/capture_supervisor.py: pumps the queue,
-      stereo→mono, stateful soxr resample →16kHz → GrowingAudioBuffer
-      (+ optional frame_sink queue for a push-style backend, drop-on-full);
-      restarts dead children (backoff; 3 fast fails in a row → fatal)
+[capture CHILD PROCESS] `audio.backend` picks who runs it:
+      rust    native/audio_capture (Rust, WASAPI directly): mono float32 @16kHz
+              on stdout, JSON lines on stderr, stdin close = stop. No PortAudio
+              and no Python in that process, so §B1 cannot happen there
+      pyaudio audio/capture_process.py: pyaudiowpatch WASAPI loopback,
+              raw float32 frames → mp.Queue (PortAudio corrupts its host
+              process's heap on idle loopback streams — §B1 — so it lives in
+              a disposable process)
+[capture-supervisor thread] audio/capture_base.py owns the restart policy for
+      both (backoff; 3 fast fails in a row → fatal) and the write into
+      GrowingAudioBuffer (+ optional frame_sink queue for a push-style backend,
+      drop-on-full). audio/capture_supervisor.py adds stereo→mono + stateful
+      soxr →16kHz; audio/rust_capture.py only slices bytes (the child already
+      resampled). audio/capture_backends.py is the factory
 [engine thread]  the ASRBackend picked by asr.engine runs its own loop here.
                  whisper (default): WhisperBackend → StreamingASREngine, every
                  1s snapshot buffer → WhisperAdapter (faster-whisper
@@ -63,6 +72,18 @@ Shutdown: single shared `stop_event`; overlay close → `app.quit()` → stop_ev
 ## Known issue (mitigated, root cause external)
 
 PyAudioWPatch 0.2.12.7 corrupts the heap of its host process after ~2-8 min of an idle loopback stream (0xc0000005 in ntdll; bisected 2026-07-15: capture-only run crashed, whisper-only loop clean over 5438 decodes). Mitigation: process isolation + supervisor restart (see above). History and crash matrix: docs/CODE_REVIEW_2026-07-15.md §B1.
+
+`audio.backend = "rust"` sidesteps it entirely — that process has no PortAudio in it. The pyaudio path stays as the no-build fallback, so the bug still applies whenever it is selected.
+
+## Native capture backend (Rust)
+
+`audio.backend = "pyaudio" | "rust"`; design, protocol and measurements live in **docs/NATIVE_CAPTURE_RUST.md** — read it before touching `native/audio_capture/`, `rust_capture.py` or `capture_base.py`.
+
+- The binary is built locally (`cargo build --release …`) and gitignored. Missing binary + `backend = "rust"` → warning and fallback to pyaudio, never a crash.
+- It delivers **mono float32 already at target_sample_rate**: downmix (channel average) and resampling (`rubato::Fft`, one long-lived state) happen in Rust, so `numpy`/`soxr` are not in that path at all.
+- Silence policy is identical to the PortAudio path *on purpose*: an idle loopback endpoint yields no packets and none are invented, so word timestamps stay tied to real captured audio. `AUDCLNT_BUFFERFLAGS_SILENT` packets are forwarded as zeros — they are real time on the device timeline.
+- `device_hint` matches the **output endpoint's** name here, not PortAudio's invented "… [Loopback]" input.
+- Tests need no audio hardware: `tests/fake_capture.py` speaks the same protocol (including a sample split across two reads and a `fatal` line) and `tests/test_rust_capture.py` runs the real supervisor against it.
 
 ## Second ASR backend (Nemotron) — done, off by default
 

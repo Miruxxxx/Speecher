@@ -15,7 +15,7 @@ from asr.events import ASREvent
 from asr.punctuation_backends import create_backend
 from asr.punctuation_worker import PunctuationWorker
 from audio.buffer import GrowingAudioBuffer
-from audio.capture_supervisor import CaptureSupervisor
+from audio.capture_backends import create_capture_supervisor
 from llm.engine import LLMEngine
 from llm.lmstudio_client import LMStudioClient
 from store.transcript_store import TranscriptStore
@@ -155,15 +155,11 @@ def main() -> None:
         queue.Queue(maxsize=256) if cfg.asr.engine == "nemotron" else None
     )
 
-    capture = CaptureSupervisor(
+    capture = create_capture_supervisor(
+        cfg,
         audio_buffer=audio_buffer,
-        device_hint=cfg.audio.device_hint,
-        target_sr=cfg.audio.target_sample_rate,
         events=raw_events,
         stop_event=stop_event,
-        frames_per_buffer=cfg.audio.frames_per_buffer,
-        max_channels=cfg.audio.max_channels,
-        restart_backoff_sec=cfg.audio.restart_backoff_sec,
         latency=latency,
         frame_sink=frame_sink,
     )
