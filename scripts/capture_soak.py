@@ -1,19 +1,17 @@
 """Soak test for the capture path: does it survive, and does it keep up?
 
-This is the acceptance harness for the native (Rust/WASAPI) capture backend.
-The thing it is looking for is the PortAudio failure from
-docs/CODE_REVIEW_2026-07-15.md B1: a process that dies with 0xc0000005 after
-2-8 minutes of an *idle* loopback stream. So the interesting run is a long one
-with the system mostly silent.
+The failure this is looking for is the historical one from
+docs/CODE_REVIEW_2026-07-15.md B1: a capture process that dies with 0xc0000005
+after 2-8 minutes of an *idle* loopback stream. So the interesting run is a
+long one with the system mostly silent.
 
-It drives the production code -- `create_capture_supervisor` with the real
-config -- and only replaces the audio sink with a meter, so nothing grows in
-memory over half an hour.
+It drives the production supervisor with the real config and only replaces the
+audio sink with a meter, so nothing grows in memory over half an hour.
 
 Usage (repo root, project venv):
 
-    .venv\\Scripts\\python scripts\\capture_soak.py --backend rust --seconds 900
-    .venv\\Scripts\\python scripts\\capture_soak.py --backend pyaudio --seconds 900
+    .venv\\Scripts\\python scripts\\capture_soak.py --seconds 900
+    .venv\\Scripts\\python scripts\\capture_soak.py --seconds 900 --source mic
 
 Columns per report line:
     wall     seconds since start
@@ -41,7 +39,7 @@ ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT / "src"))
 
 from app_config import load_config  # noqa: E402
-from audio.capture_backends import create_capture_supervisor  # noqa: E402
+from audio.rust_capture import RustCaptureSupervisor, resolve_binary  # noqa: E402
 
 
 class Meter:
@@ -73,25 +71,32 @@ class Meter:
 
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--backend", choices=("rust", "pyaudio"), default=None,
-                        help="override audio.backend from config/config.toml")
+    parser.add_argument("--source", choices=("loopback", "mic"), default=None,
+                        help="override audio.source from config/config.toml")
     parser.add_argument("--seconds", type=float, default=900.0)
     parser.add_argument("--report-every", type=float, default=30.0)
     args = parser.parse_args()
 
     cfg = load_config(ROOT / "config" / "config.toml")
-    if args.backend:
-        cfg.audio.backend = args.backend
+    if args.source:
+        cfg.audio.source = args.source
 
     meter = Meter(cfg.audio.target_sample_rate)
     events: "queue.Queue" = queue.Queue(maxsize=1000)
     stop_event = threading.Event()
 
-    supervisor = create_capture_supervisor(
-        cfg, audio_buffer=meter, events=events, stop_event=stop_event
+    supervisor = RustCaptureSupervisor(
+        audio_buffer=meter,
+        binary_path=resolve_binary(cfg.audio.binary),
+        device_hint=cfg.audio.device_hint,
+        target_sr=cfg.audio.target_sample_rate,
+        events=events,
+        stop_event=stop_event,
+        source=cfg.audio.source,
+        restart_backoff_sec=cfg.audio.restart_backoff_sec,
     )
     print(
-        f"backend={cfg.audio.backend} device_hint='{cfg.audio.device_hint}' "
+        f"device_hint='{cfg.audio.device_hint}' "
         f"source={cfg.audio.source} target_sr={cfg.audio.target_sample_rate} "
         f"-> {args.seconds:.0f}s soak, report every {args.report_every:.0f}s",
         flush=True,

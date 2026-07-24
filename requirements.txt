@@ -11,12 +11,16 @@
 # ctranslate2 тянет их сам через pip-зависимости.
 
 faster-whisper>=1.2.1
-PyAudioWPatch>=0.2.12.7
 PyQt6>=6.11.0
 numpy>=2.3
-soxr>=1.0             # стриминговый ресемплер с состоянием
 openai>=2.34          # клиент для LM Studio (OpenAI-совместимый REST)
 torch>=2.11           # CUDA-сборка, см. шапку
+
+# --- Захват звука ---
+# Питоновских зависимостей у него больше нет: звук берёт нативный бинарь
+# native/audio_capture (Rust + WASAPI), он же делает downmix и ресемплинг.
+# Нужен rustup со stable-x86_64-pc-windows-msvc, сборка:
+#   cargo build --release --manifest-path native/audio_capture/Cargo.toml
 
 # --- ASR-движок nemotron (config: [asr].engine = "nemotron") ---
 # transformers дают AutoModelForRNNT/AutoProcessor; librosa и accelerate

@@ -61,26 +61,16 @@ def test_numeric_coercion_int_to_float(tmp_path: Path):
     assert isinstance(cfg.asr.chunk_interval_sec, float)
 
 
-def test_capture_backend_is_normalized(tmp_path: Path):
+def test_capture_source_is_normalized(tmp_path: Path):
     p = tmp_path / "config.toml"
-    p.write_text(
-        '[audio]\nbackend = "RUST"\nsource = "MIC"\n',
-        encoding="utf-8",
-    )
-    cfg = load_config(p)
-    assert cfg.audio.backend == "rust"
-    assert cfg.audio.source == "mic"
+    p.write_text('[audio]\nsource = "MIC"\n', encoding="utf-8")
+    assert load_config(p).audio.source == "mic"
 
 
-def test_unknown_capture_backend_falls_back(tmp_path: Path):
+def test_unknown_capture_source_falls_back(tmp_path: Path):
     p = tmp_path / "config.toml"
-    p.write_text(
-        '[audio]\nbackend = "cpal"\nsource = "speakers"\n',
-        encoding="utf-8",
-    )
-    cfg = load_config(p)
-    assert cfg.audio.backend == "pyaudio"
-    assert cfg.audio.source == "loopback"
+    p.write_text('[audio]\nsource = "speakers"\n', encoding="utf-8")
+    assert load_config(p).audio.source == "loopback"
 
 
 def test_broken_toml_falls_back_to_defaults(tmp_path: Path):

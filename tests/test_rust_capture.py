@@ -6,14 +6,8 @@ from pathlib import Path
 
 import numpy as np
 
-from app_config import AppConfig
 from audio.buffer import GrowingAudioBuffer
-from audio.capture_backends import (
-    DEFAULT_RUST_BINARY,
-    create_capture_supervisor,
-    resolve_rust_binary,
-)
-from audio.rust_capture import RustCaptureSupervisor
+from audio.rust_capture import DEFAULT_BINARY, RustCaptureSupervisor, resolve_binary
 
 FAKE = Path(__file__).with_name("fake_capture.py")
 
@@ -142,33 +136,41 @@ def test_stop_ends_a_child_that_is_waiting_on_silence(monkeypatch):
     assert supervisor._thread is None
 
 
-def test_missing_binary_falls_back_to_pyaudio(tmp_path):
-    cfg = AppConfig()
-    cfg.audio.backend = "rust"
-    cfg.audio.rust_binary = str(tmp_path / "not-built-yet.exe")
-    supervisor = create_capture_supervisor(
-        cfg,
+def test_missing_binary_is_fatal_and_says_how_to_build(tmp_path):
+    # There is no second capture path any more: a missing binary must stop the
+    # app with a message, not retry quietly.
+    events: "queue.Queue" = queue.Queue(maxsize=50)
+    stop_event = threading.Event()
+    supervisor = RustCaptureSupervisor(
         audio_buffer=GrowingAudioBuffer(sample_rate=16000),
-        events=queue.Queue(),
-        stop_event=threading.Event(),
+        binary_path=tmp_path / "not-built-yet.exe",
+        device_hint="",
+        target_sr=16000,
+        events=events,
+        stop_event=stop_event,
     )
-    assert type(supervisor).__name__ == "CaptureSupervisor"
+    supervisor.start()
+    try:
+        assert wait_until(stop_event.is_set, timeout=5.0)
+    finally:
+        supervisor.stop()
+
+    fatals = [ev.text for ev in drain(events) if ev.type == "fatal"]
+    assert fatals
+    assert "not-built-yet.exe" in fatals[0]
+    assert "cargo build" in fatals[0]
 
 
-def test_existing_binary_selects_the_rust_backend(tmp_path):
-    binary = tmp_path / "audio_capture.exe"
-    binary.write_bytes(b"")
-    cfg = AppConfig()
-    cfg.audio.backend = "rust"
-    cfg.audio.rust_binary = str(binary)
-    cfg.audio.source = "mic"
-    supervisor = create_capture_supervisor(
-        cfg,
+def test_command_line_matches_the_config(tmp_path):
+    supervisor = RustCaptureSupervisor(
         audio_buffer=GrowingAudioBuffer(sample_rate=16000),
+        binary_path=tmp_path / "audio_capture.exe",
+        device_hint="HyperX",
+        target_sr=16000,
         events=queue.Queue(),
         stop_event=threading.Event(),
+        source="mic",
     )
-    assert isinstance(supervisor, RustCaptureSupervisor)
     assert supervisor._command()[1:] == [
         "--source",
         "mic",
@@ -179,20 +181,9 @@ def test_existing_binary_selects_the_rust_backend(tmp_path):
     ]
 
 
-def test_default_backend_is_pyaudio():
-    cfg = AppConfig()
-    supervisor = create_capture_supervisor(
-        cfg,
-        audio_buffer=GrowingAudioBuffer(sample_rate=16000),
-        events=queue.Queue(),
-        stop_event=threading.Event(),
-    )
-    assert type(supervisor).__name__ == "CaptureSupervisor"
-
-
 def test_binary_path_resolution():
-    assert resolve_rust_binary("") == DEFAULT_RUST_BINARY
-    assert DEFAULT_RUST_BINARY.name == "audio_capture.exe"
+    assert resolve_binary("") == DEFAULT_BINARY
+    assert DEFAULT_BINARY.name == "audio_capture.exe"
     # A relative path follows the repository, not the current directory.
-    assert resolve_rust_binary("native/x.exe").is_absolute()
-    assert resolve_rust_binary(r"C:\tools\x.exe") == Path(r"C:\tools\x.exe")
+    assert resolve_binary("native/x.exe").is_absolute()
+    assert resolve_binary(r"C:\tools\x.exe") == Path(r"C:\tools\x.exe")

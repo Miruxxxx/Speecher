@@ -21,15 +21,35 @@ _CREATE_NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0)
 # returns as soon as anything is available, so this only caps the batch size.
 _READ_BYTES = 8192
 
+# src/audio/rust_capture.py -> repository root
+PROJECT_ROOT = Path(__file__).resolve().parents[2]
+DEFAULT_BINARY = (
+    PROJECT_ROOT / "native" / "audio_capture" / "target" / "release" / "audio_capture.exe"
+)
+BUILD_HINT = "cargo build --release --manifest-path native/audio_capture/Cargo.toml"
+
+
+def resolve_binary(configured: str = "") -> Path:
+    """Where the capture binary is expected to live.
+
+    An empty config value means "the release build in the tree"; a relative
+    path is resolved against the repository root, not the current directory,
+    so the app behaves the same however it was started.
+    """
+    configured = (configured or "").strip()
+    if not configured:
+        return DEFAULT_BINARY
+    path = Path(configured).expanduser()
+    return path if path.is_absolute() else PROJECT_ROOT / path
+
 
 class RustCaptureSupervisor(CaptureSupervisorBase):
     """
     Runs native/audio_capture (WASAPI, Rust) as the capture child.
 
-    Same job as CaptureSupervisor, minus PortAudio and minus the conversion
-    work: the native child already delivers mono float32 at the target rate, so
-    this side only turns bytes into arrays. See native/audio_capture/src/main.rs
-    for the protocol:
+    The child does the conversion work too: it already delivers mono float32 at
+    the target rate, so this side only turns bytes into arrays. See
+    native/audio_capture/src/main.rs for the protocol:
 
       stdout  raw little-endian f32, mono, target rate -- nothing else
       stderr  one JSON object per line: info / log / fatal
@@ -37,8 +57,9 @@ class RustCaptureSupervisor(CaptureSupervisorBase):
               (it blocks waiting for audio and cannot poll an event)
       exit    0 = clean, 1 = setup failure, 2 = device failure mid-stream
 
-    A child that dies is restarted by the base class exactly like the PortAudio
-    one; the difference is that this one is not expected to die.
+    A child that dies is restarted by the base class with backoff; three deaths
+    within seconds of starting are treated as a permanent problem and stop the
+    app, which is also how a missing binary surfaces.
     """
 
     def __init__(
@@ -86,6 +107,14 @@ class RustCaptureSupervisor(CaptureSupervisorBase):
 
     def _run_one_child(self) -> str:
         self._last_fatal = None
+        if not self._binary.is_file():
+            # There is no second capture path to fall back to, so say exactly
+            # what is missing and how to get it instead of retrying blindly.
+            self._emit_fatal(
+                f"нативный бинарь захвата не найден: {self._binary}\nсобрать: {BUILD_HINT}"
+            )
+            self._stop_event.set()
+            return f"binary missing: {self._binary}"
         try:
             # bufsize=0: read() must return as soon as a packet lands, not when
             # some Python-side buffer happens to fill.
@@ -101,7 +130,7 @@ class RustCaptureSupervisor(CaptureSupervisorBase):
             return f"cannot start {self._binary}: {exc!r}"
 
         self._proc = proc
-        self._emit_log(f"capture child started (pid={proc.pid}, backend=rust)")
+        self._emit_log(f"capture child started (pid={proc.pid})")
         err_thread = threading.Thread(
             target=self._pump_stderr, args=(proc,), name="capture-stderr", daemon=True
         )

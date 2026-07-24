@@ -12,10 +12,7 @@ logger = logging.getLogger(__name__)
 # to "whisper" with a warning instead of crashing at startup.
 KNOWN_ASR_ENGINES = ("whisper", "nemotron")
 
-# Capture backends `create_capture_supervisor` knows how to build. Unknown
-# names fall back to "pyaudio" with a warning.
-KNOWN_CAPTURE_BACKENDS = ("pyaudio", "rust")
-# What the native backend can capture: system output or a recording endpoint.
+# What the capture binary can record: system output or a recording endpoint.
 KNOWN_CAPTURE_SOURCES = ("loopback", "mic")
 
 # Right attention contexts the Nemotron checkpoint was trained with, in
@@ -26,22 +23,16 @@ NEMOTRON_DTYPES = ("float32", "float16", "bfloat16")
 
 @dataclass(slots=True)
 class AudioConfig:
-    # Which process does the capturing (see src/audio/capture_backends.py).
-    # "rust" needs native/audio_capture built; missing binary → "pyaudio".
-    backend: str = "pyaudio"
+    # Substring of the *output* endpoint's name (the capture binary opens it in
+    # loopback mode); empty picks the default endpoint.
     device_hint: str = "HyperX"
     target_sample_rate: int = 16000
-    # PortAudio only: the native backend follows the WASAPI device period.
-    frames_per_buffer: int = 2048
-    # PortAudio only: WASAPI shared mode dictates the channel count, and the
-    # native backend downmixes whatever it gets.
-    max_channels: int = 2
     restart_backoff_sec: float = 2.0
-    # Native backend only. "mic" is groundwork for the two-track mode
-    # (docs/ROADMAP.md stage 4), not a finished feature.
+    # "mic" is groundwork for the two-track mode (docs/ROADMAP.md stage 4),
+    # not a finished feature.
     source: str = "loopback"
     # "" = native/audio_capture/target/release/audio_capture.exe in the tree.
-    rust_binary: str = ""
+    binary: str = ""
 
 
 @dataclass(slots=True)
@@ -185,15 +176,6 @@ def load_config(path: str | Path) -> AppConfig:
 
 def _normalize(cfg: AppConfig) -> None:
     """Fix up values that are the right type but not a valid choice."""
-    backend = cfg.audio.backend.strip().lower()
-    if backend not in KNOWN_CAPTURE_BACKENDS:
-        logger.warning(
-            "config: audio.backend=%r is unknown (known: %s); using 'pyaudio'",
-            cfg.audio.backend, ", ".join(KNOWN_CAPTURE_BACKENDS),
-        )
-        backend = "pyaudio"
-    cfg.audio.backend = backend
-
     source = cfg.audio.source.strip().lower()
     if source not in KNOWN_CAPTURE_SOURCES:
         logger.warning(

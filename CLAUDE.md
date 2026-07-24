@@ -20,20 +20,14 @@ All tunables live in `config/config.toml` (loaded by `src/app_config.py` over da
 ## Architecture (data flow)
 
 ```
-[capture CHILD PROCESS] `audio.backend` picks who runs it:
-      rust    native/audio_capture (Rust, WASAPI directly): mono float32 @16kHz
-              on stdout, JSON lines on stderr, stdin close = stop. No PortAudio
-              and no Python in that process, so §B1 cannot happen there
-      pyaudio audio/capture_process.py: pyaudiowpatch WASAPI loopback,
-              raw float32 frames → mp.Queue (PortAudio corrupts its host
-              process's heap on idle loopback streams — §B1 — so it lives in
-              a disposable process)
-[capture-supervisor thread] audio/capture_base.py owns the restart policy for
-      both (backoff; 3 fast fails in a row → fatal) and the write into
-      GrowingAudioBuffer (+ optional frame_sink queue for a push-style backend,
-      drop-on-full). audio/capture_supervisor.py adds stereo→mono + stateful
-      soxr →16kHz; audio/rust_capture.py only slices bytes (the child already
-      resampled). audio/capture_backends.py is the factory
+[capture CHILD PROCESS] native/audio_capture (Rust, WASAPI directly): mono
+      float32 @16kHz on stdout, JSON lines on stderr, stdin close = stop.
+      Downmix and resampling happen there; no Python and no PortAudio in that
+      process (that library was the cause of §B1 and is gone)
+[capture-supervisor thread] audio/capture_base.py: restart policy (backoff;
+      3 fast fails in a row → fatal) + the write into GrowingAudioBuffer
+      (+ optional frame_sink queue for a push-style backend, drop-on-full);
+      audio/rust_capture.py runs the child and slices its bytes into arrays
 [engine thread]  the ASRBackend picked by asr.engine runs its own loop here.
                  whisper (default): WhisperBackend → StreamingASREngine, every
                  1s snapshot buffer → WhisperAdapter (faster-whisper
@@ -69,25 +63,23 @@ Shutdown: single shared `stop_event`; overlay close → `app.quit()` → stop_ev
 - Everything network-ish (LM Studio health, LLM calls) stays off the UI thread; `LMStudioClient` has max_retries=0 and a 2s health timeout for exactly that reason.
 - multiprocessing uses **spawn**: capture child target must stay a top-level importable function; `python -m src` main module is skipped on child bootstrap (safe), but scratch scripts that spawn must guard `if __name__ == "__main__"`.
 
-## Known issue (mitigated, root cause external)
+## Former blocker (root cause removed 2026-07-24)
 
-PyAudioWPatch 0.2.12.7 corrupts the heap of its host process after ~2-8 min of an idle loopback stream (0xc0000005 in ntdll; bisected 2026-07-15: capture-only run crashed, whisper-only loop clean over 5438 decodes). Mitigation: process isolation + supervisor restart (see above). History and crash matrix: docs/CODE_REVIEW_2026-07-15.md §B1.
+PyAudioWPatch 0.2.12.7 corrupted the heap of its host process after ~2-8 min of an idle loopback stream (0xc0000005 in ntdll; bisected 2026-07-15: capture-only run crashed, whisper-only loop clean over 5438 decodes). It was mitigated by process isolation, then removed outright: capture is native now and the library is no longer a dependency. History and crash matrix: docs/CODE_REVIEW_2026-07-15.md §B1 — keep it in mind before reintroducing any PortAudio-based capture.
 
-`audio.backend = "rust"` sidesteps it entirely — that process has no PortAudio in it. The pyaudio path stays as the no-build fallback, so the bug still applies whenever it is selected.
+## Capture is a native binary (Rust)
 
-## Native capture backend (Rust)
+Design, protocol and measurements live in **docs/NATIVE_CAPTURE_RUST.md** — read it before touching `native/audio_capture/`, `rust_capture.py` or `capture_base.py`.
 
-`audio.backend = "pyaudio" | "rust"`; design, protocol and measurements live in **docs/NATIVE_CAPTURE_RUST.md** — read it before touching `native/audio_capture/`, `rust_capture.py` or `capture_base.py`.
-
-- The binary is built locally (`cargo build --release …`) and gitignored. Missing binary + `backend = "rust"` → warning and fallback to pyaudio, never a crash.
+- The binary is built locally (`cargo build --release …`) and gitignored. There is no second capture path: a missing binary is a fatal event naming the build command, not a fallback.
 - It delivers **mono float32 already at target_sample_rate**: downmix (channel average) and resampling (`rubato::Fft`, one long-lived state) happen in Rust, so `numpy`/`soxr` are not in that path at all.
 - Silence policy is identical to the PortAudio path *on purpose*: an idle loopback endpoint yields no packets and none are invented, so word timestamps stay tied to real captured audio. `AUDCLNT_BUFFERFLAGS_SILENT` packets are forwarded as zeros — they are real time on the device timeline.
-- `device_hint` matches the **output endpoint's** name here, not PortAudio's invented "… [Loopback]" input.
+- `device_hint` matches the **output endpoint's** name (WASAPI opens loopback on a render endpoint), not the "… [Loopback]" input PortAudio used to invent.
 - Tests need no audio hardware: `tests/fake_capture.py` speaks the same protocol (including a sample split across two reads and a `fatal` line) and `tests/test_rust_capture.py` runs the real supervisor against it.
 
 ## Second ASR backend (Nemotron) — done, off by default
 
-`asr.engine = "whisper" | "nemotron"`; the migration and every measurement live in **docs/MIGRATION_NEMOTRON.md** — read it before touching `nemotron_backend.py`, `streaming_engine.py`, `whisper_adapter.py` or `capture_supervisor.py`. All four phases are done (2026-07-23); `src/asr/nemotron_backend.py` streams live in `.venv` (~0.7 s to a word vs 2.5-3.5 s for whisper).
+`asr.engine = "whisper" | "nemotron"`; the migration and every measurement live in **docs/MIGRATION_NEMOTRON.md** — read it before touching `nemotron_backend.py`, `streaming_engine.py`, `whisper_adapter.py` or the capture path. All four phases are done (2026-07-23); `src/asr/nemotron_backend.py` streams live in `.venv` (~0.7 s to a word vs 2.5-3.5 s for whisper).
 
 **Whisper stays the default on purpose**: both engines were only ever measured on synthesized speech (silero TTS, SAPI), and nemotron's open limits — `input_ids` growing linearly inside the one long-lived `generate()`, encoder context surviving a minute of silence, no RMS silence gate — show up on long live sessions, not on 12-second files. Flipping the default needs a real-speech run, not a code change. A backend that fails to load falls back to whisper with a status message.
 

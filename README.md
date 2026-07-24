@@ -8,7 +8,7 @@
 
 | Слой | Технология |
 |---|---|
-| Захват звука | PyAudioWPatch (WASAPI loopback) **в отдельном подпроцессе** с супервизором и авто-рестартом; soxr (стриминговый ресемплинг → 16 kHz) |
+| Захват звука | нативный бинарь на Rust (WASAPI loopback напрямую) **в отдельном процессе** с супервизором и авто-рестартом; downmix и ресемплинг → 16 kHz там же |
 | ASR | два переключаемых движка (`[asr] engine`): **whisper** (по умолчанию) — faster-whisper `large-v3-turbo` на CUDA fp16 + LocalAgreement-2 с гейтом тишины и фильтрами галлюцинаций; **nemotron** — `nvidia/nemotron-3.5-asr-streaming-0.6b`, cache-aware стриминг, ~0.7 с до слова, пунктуация нативная |
 | Пунктуация | silero-te (ru/en/de/es, CPU) — только для движка whisper; nemotron пунктуирует сам |
 | LLM | LM Studio через OpenAI-совместимый REST (`localhost:1234`) |
@@ -22,10 +22,15 @@ Python 3.11, только Windows (WASAPI loopback).
 python -m venv .venv
 .venv\Scripts\python -m pip install torch --index-url https://download.pytorch.org/whl/cu128
 .venv\Scripts\python -m pip install -r requirements.txt
+cargo build --release --manifest-path native\audio_capture\Cargo.toml
 ```
 
 torch ставится первым и отдельным индексом: с PyPI приедет `+cpu`, и движок
 nemotron работать не будет (подробности — в шапке `requirements.txt`).
+
+Последняя строка собирает захват звука — без неё приложение стартует, но сразу
+скажет, что бинарь не найден. Нужен [rustup](https://rustup.rs) с
+`stable-x86_64-pc-windows-msvc`; линкер берётся из Visual Studio Build Tools.
 
 Требования:
 - NVIDIA GPU + драйвер для faster-whisper на CUDA (либо `device = "cpu"` + `compute_type = "int8"` в конфиге — медленнее).
@@ -42,7 +47,7 @@ python -m src
 
 Все настройки — в [config/config.toml](config/config.toml) (файл можно удалить — приложение запустится на дефолтах). Ключевое:
 
-- `[audio] device_hint` — подстрока имени устройства вывода, чей loopback слушаем (`"HyperX"`).
+- `[audio] device_hint` — подстрока имени устройства вывода, чей loopback слушаем (`"HyperX"`); пусто = устройство по умолчанию. `source = "mic"` переключает захват на микрофон, `binary` — путь к бинарю захвата, если он лежит не в дереве проекта.
 - `[asr] engine` — `whisper` (по умолчанию) или `nemotron`; неизвестное значение → `whisper` с предупреждением. Ключи ниже относятся к whisper-пути.
 - `[asr.nemotron]` — читается только при `engine = "nemotron"`: модель, `dtype` (`float32` по умолчанию — fp16 экономит VRAM, но декодирует вдвое медленнее), `lookahead_tokens` `0/3/6/13` → задержка 80/320/560/1120 мс.
 - `[asr] model / device / language` — модель Whisper, cuda/cpu и режим языка:
@@ -65,14 +70,15 @@ python -m src
 ```
 config/
   config.toml              # все настройки (TOML)
+native/
+  audio_capture/           # захват звука на Rust (WASAPI): бинарь + его тесты
 src/
   main.py                  # сборка пайплайна: окно сразу, модели в фоне
   app_config.py            # загрузка config.toml поверх дефолтов
   audio/
-    capture_process.py     # ДОЧЕРНИЙ ПРОЦЕСС: PortAudio loopback → mp.Queue
-    capture_supervisor.py  # спавн/рестарт ребёнка, mono+soxr → буфер
+    rust_capture.py        # спавн/рестарт нативного ребёнка, байты → буфер
+    capture_base.py        # политика рестарта, запись в буфер/frame_sink
     buffer.py              # GrowingAudioBuffer: append-only + head-trim
-    devices.py             # выбор loopback-устройства по подстроке имени
   asr/
     backends.py            # протокол ASRBackend + выбор движка по [asr] engine
     whisper_backend.py     # pull-путь: снапшоты буфера → StreamingASREngine
@@ -101,13 +107,14 @@ storage/transcripts/       # (зарезервировано под персис
 
 ## Известные проблемы
 
-1. **PyAudioWPatch (PortAudio) портит кучу своего процесса** после нескольких минут простаивающего loopback-стрима — поэтому захват вынесен в одноразовый дочерний процесс: его падение переживается авто-рестартом (пауза `restart_backoff_sec`, в тишине данные всё равно не идут). Корневая причина остаётся в библиотеке; альтернативы — в [docs/ROADMAP.md](docs/ROADMAP.md).
+1. Захват требует собранного бинаря (`cargo build --release …`): без него приложение сразу скажет, чего не хватает, — запасного пути на питоновских библиотеках нет. Раньше эту роль играл PyAudioWPatch, который портил кучу своего процесса после нескольких минут простаивающего loopback-стрима (история — [docs/CODE_REVIEW_2026-07-15.md](docs/CODE_REVIEW_2026-07-15.md) §B1); он удалён вместе с этим багом.
 2. WASAPI loopback отдаёт фреймы только пока что-то играет: в полной тишине захват «молчит» — это нормально.
 3. Модель `large-v3-turbo` на слабом GPU может не укладываться в 1-секундный цикл — поставьте `small`/`base` в конфиге.
 
 ## Диагностика
 
-- Список loopback-устройств: `python scripts/list_audio_devices.py`
+- Список устройств: `python scripts/list_audio_devices.py`
+- Долгий прогон захвата: `python scripts/capture_soak.py --seconds 900`
 - `[ui] console_verbose_logs = true` — показывает log-события движка (рестарты захвата, force-commit) в консоли.
 - Тесты: `python -m pytest tests/ -q`
 - Крэши смотреть в Windows Event Log: `Get-WinEvent -FilterHashtable @{LogName='Application'; ProviderName='Application Error'} | ? Message -match 'python'`

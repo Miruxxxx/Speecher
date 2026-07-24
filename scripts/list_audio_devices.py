@@ -1,10 +1,7 @@
 """Enumerate audio endpoints and show which one `audio.device_hint` picks.
 
-Prefers the native binary (native/audio_capture --list-devices): it asks WASAPI
-directly, so the names are exactly the ones the rust backend matches against.
-Without a built binary it falls back to PortAudio's view of loopback devices,
-which is what the pyaudio backend matches instead -- the two lists differ, and
-that is the point of printing which one you are looking at.
+Asks the capture binary (`audio_capture --list-devices`), i.e. WASAPI itself,
+so the names here are exactly the ones the app matches against.
 
 Usage (repo root, project venv):
 
@@ -22,10 +19,10 @@ ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT / "src"))
 
 from app_config import load_config  # noqa: E402
-from audio.capture_backends import resolve_rust_binary  # noqa: E402
+from audio.rust_capture import BUILD_HINT, resolve_binary  # noqa: E402
 
 
-def print_native(binary: Path, hint: str) -> None:
+def print_devices(binary: Path, hint: str) -> None:
     out = subprocess.run(
         [str(binary), "--list-devices"], capture_output=True, timeout=30
     )
@@ -52,43 +49,16 @@ def print_native(binary: Path, hint: str) -> None:
             )
 
 
-def print_portaudio(hint: str) -> None:
-    import pyaudiowpatch as pyaudio
-
-    from audio.devices import list_loopbacks, pick_loopback_device
-
-    pa = pyaudio.PyAudio()
-    try:
-        loopbacks = list_loopbacks(pa)
-        print("\nLOOPBACK-устройства PortAudio:")
-        for idx, name, channels, rate in loopbacks:
-            print(f"  [{idx}] {name}  |  {rate} Hz, {channels}ch")
-        if loopbacks:
-            idx, name, _, _ = pick_loopback_device(pa, hint)
-            print(f"\ndevice_hint='{hint}' выбирает: [{idx}] {name}")
-    finally:
-        pa.terminate()
-
-
 def main() -> int:
     cfg = load_config(ROOT / "config" / "config.toml")
-    hint = cfg.audio.device_hint
-    binary = resolve_rust_binary(cfg.audio.rust_binary)
+    binary = resolve_binary(cfg.audio.binary)
 
-    if binary.is_file():
-        print(f"WASAPI напрямую ({binary.name}), backend='{cfg.audio.backend}':")
-        try:
-            print_native(binary, hint)
-            return 0
-        except Exception as exc:  # noqa: BLE001 - a probe script, show and fall back
-            print(f"нативный список не получился ({exc!r}); падаю на PortAudio")
-    else:
-        print(
-            f"нативный бинарь не собран ({binary}), показываю список PortAudio.\n"
-            "Собрать: cargo build --release --manifest-path native/audio_capture/Cargo.toml"
-        )
+    if not binary.is_file():
+        print(f"бинарь захвата не собран: {binary}\nсобрать: {BUILD_HINT}")
+        return 1
 
-    print_portaudio(hint)
+    print(f"WASAPI напрямую ({binary.name}):")
+    print_devices(binary, cfg.audio.device_hint)
     return 0
 
 

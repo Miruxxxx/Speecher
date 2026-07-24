@@ -9,7 +9,7 @@ from app_config import AppConfig, load_config
 from asr.backends import create_asr_backend
 from asr.whisper_backend import WhisperBackend
 from audio.buffer import GrowingAudioBuffer
-from audio.capture_supervisor import CaptureSupervisor
+from audio.rust_capture import RustCaptureSupervisor
 
 
 def _backend(engine: str) -> WhisperBackend:
@@ -149,12 +149,13 @@ def test_attach_punct_at_falls_back_to_closest_when_outside_tol():
     assert store.all_text() == "привет мир."
 
 
-def _supervisor(**kwargs) -> CaptureSupervisor:
-    return CaptureSupervisor(
+def _supervisor(events=None, **kwargs) -> RustCaptureSupervisor:
+    return RustCaptureSupervisor(
         audio_buffer=GrowingAudioBuffer(sample_rate=16000),
+        binary_path="unused-here.exe",  # nothing is started in these tests
         device_hint="",
         target_sr=16000,
-        events=queue.Queue(),
+        events=events if events is not None else queue.Queue(),
         stop_event=threading.Event(),
         **kwargs,
     )
@@ -173,14 +174,7 @@ def test_frame_sink_receives_chunks():
 def test_frame_sink_full_drops_and_counts():
     sink: "queue.Queue[np.ndarray]" = queue.Queue(maxsize=1)
     events: "queue.Queue" = queue.Queue()
-    sup = CaptureSupervisor(
-        audio_buffer=GrowingAudioBuffer(sample_rate=16000),
-        device_hint="",
-        target_sr=16000,
-        events=events,
-        stop_event=threading.Event(),
-        frame_sink=sink,
-    )
+    sup = _supervisor(events=events, frame_sink=sink)
     chunk = np.zeros(160, dtype=np.float32)
 
     for _ in range(3):

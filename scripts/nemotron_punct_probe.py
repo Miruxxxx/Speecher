@@ -22,7 +22,8 @@ Usage (from the repo root, project venv):
 
 `record` captures WASAPI loopback, so PLAY a Russian dialog with questions
 (system audio) while it runs. `decode` needs the project venv (CUDA torch +
-transformers); `record` alone needs only pyaudiowpatch + soxr.
+transformers); `record` alone needs only the built capture binary
+(native/audio_capture).
 """
 
 from __future__ import annotations
@@ -46,46 +47,59 @@ SAMPLE_RATE = 16000
 
 # -- recording -----------------------------------------------------------
 
+class _Collector:
+    """Audio sink with the GrowingAudioBuffer's write() contract."""
+
+    def __init__(self) -> None:
+        self.chunks: list[np.ndarray] = []
+        self._lock = threading.Lock()
+
+    def write(self, data: np.ndarray) -> None:
+        with self._lock:
+            self.chunks.append(np.array(data, copy=True))
+
+
 def record_loopback(seconds: float, out_path: Path, device_hint: str = "") -> None:
     """Capture `seconds` of WASAPI loopback to a 16 kHz mono PCM16 WAV.
 
-    Mirrors the app's capture: stereo->mono, stateful soxr resample. Kept short
-    on purpose - the idle-loopback heap bug (docs/CODE_REVIEW_2026-07-15.md B1)
-    only bites after minutes.
+    Runs the app's own capture child, so the file holds exactly what the ASR
+    would have been fed - downmix and resampling included.
     """
-    import pyaudiowpatch as pyaudio
-    import soxr
+    from app_config import load_config
+    from audio.rust_capture import RustCaptureSupervisor, resolve_binary
 
-    from audio.devices import pick_loopback_device
-
-    pa = pyaudio.PyAudio()
-    idx, name, ch, src_sr = pick_loopback_device(pa, device_hint)
-    channels = max(1, int(ch))
-    print(f"[record] device: {name} (idx {idx}, {channels}ch @ {src_sr} Hz)")
-    print(f"[record] PLAY your audio now - capturing {seconds:.0f} s ...")
-
-    frames_per_buffer = 4096
-    resampler = soxr.ResampleStream(src_sr, SAMPLE_RATE, 1, dtype="float32")
-    collected: list[np.ndarray] = []
-
-    stream = pa.open(
-        format=pyaudio.paFloat32, channels=channels, rate=int(src_sr),
-        input=True, input_device_index=idx, frames_per_buffer=frames_per_buffer,
+    cfg = load_config(ROOT / "config" / "config.toml")
+    sink = _Collector()
+    events: "queue.Queue" = queue.Queue(maxsize=200)
+    stop_event = threading.Event()
+    supervisor = RustCaptureSupervisor(
+        audio_buffer=sink,
+        binary_path=resolve_binary(cfg.audio.binary),
+        device_hint=device_hint or cfg.audio.device_hint,
+        target_sr=SAMPLE_RATE,
+        events=events,
+        stop_event=stop_event,
     )
-    try:
-        t_end = time.monotonic() + seconds
-        while time.monotonic() < t_end:
-            raw = stream.read(frames_per_buffer, exception_on_overflow=False)
-            audio = np.frombuffer(raw, dtype=np.float32)
-            if channels > 1:
-                audio = audio.reshape(-1, channels).mean(axis=1)
-            collected.append(resampler.resample_chunk(audio))
-    finally:
-        stream.stop_stream()
-        stream.close()
-        pa.terminate()
 
-    mono = np.concatenate(collected) if collected else np.empty(0, dtype=np.float32)
+    print(f"[record] PLAY your audio now - capturing {seconds:.0f} s ...")
+    supervisor.start()
+    try:
+        deadline = time.monotonic() + seconds
+        while time.monotonic() < deadline and not stop_event.is_set():
+            time.sleep(0.2)
+    finally:
+        supervisor.stop()
+        stop_event.set()
+
+    while True:
+        try:
+            ev = events.get_nowait()
+        except queue.Empty:
+            break
+        if ev.type == "fatal" or "device=" in (ev.text or ""):
+            print(f"[record] {ev.text}")
+
+    mono = np.concatenate(sink.chunks) if sink.chunks else np.empty(0, dtype=np.float32)
     _write_wav(out_path, mono)
     dur = len(mono) / SAMPLE_RATE
     peak = float(np.abs(mono).max()) if len(mono) else 0.0
