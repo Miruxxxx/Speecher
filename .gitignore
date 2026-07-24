@@ -21,5 +21,9 @@ storage/transcripts/*
 # Логи
 *.log
 
+# Записи для ручных прогонов (probe.wav и т.п.) — большие бинарники,
+# в историю их класть незачем: скрипты в scripts/ принимают любой путь
+*.wav
+
 # Claude Code (личные настройки, не коммитить)
 .claude/settings.local.json
