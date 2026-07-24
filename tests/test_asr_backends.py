@@ -73,7 +73,7 @@ def _words(items):
     from asr.nemotron_backend import WordAssembler
 
     late: list[str] = []
-    a = WordAssembler(0.08, on_late_punct=late.append)
+    a = WordAssembler(0.08, on_late_punct=lambda text, t: late.append(text))
     out = []
     for piece, frame in items:
         out += a.push(piece, frame)
@@ -91,8 +91,8 @@ def test_punctuation_attaches_when_word_still_open():
 def test_late_punctuation_after_flush_is_reported_not_dropped():
     from asr.nemotron_backend import WordAssembler
 
-    late: list[str] = []
-    a = WordAssembler(0.08, idle_flush_sec=2.0, on_late_punct=late.append)
+    late: list[tuple[str, float]] = []
+    a = WordAssembler(0.08, idle_flush_sec=2.0, on_late_punct=lambda text, t: late.append((text, t)))
 
     out = a.push(" встреча", 100)
     assert out == []
@@ -101,9 +101,11 @@ def test_late_punctuation_after_flush_is_reported_not_dropped():
         out += a.advance(f)
     assert [w.text for w in out] == ["встреча"]  # committed without the mark
 
-    # The late '?' now has no word to attach to -> surfaced as late punctuation.
+    # The late '?' now has no word to attach to -> surfaced as late punctuation,
+    # carrying its own emission time (frame 128 * 0.08 s) so it can be bound by
+    # timestamp downstream rather than pinned to whatever word is last.
     assert a.push("?", 128) == []
-    assert late == ["?"]
+    assert late == [("?", 128 * 0.08)]
 
 
 def test_append_to_last_word_amends_in_place():
@@ -116,6 +118,35 @@ def test_append_to_last_word_amends_in_place():
 
     assert store.all_text() == "привет встреча?"
     assert store.size() == 2  # no new entry, indices intact
+
+
+def test_attach_punct_at_binds_by_timestamp_not_last_word():
+    from asr.events import Word
+    from store.transcript_store import TranscriptStore
+
+    store = TranscriptStore()
+    store.append([Word("встреча", 8.0, 9.0)])
+    store.append([Word("Давайте", 9.0, 9.3)])
+    store.append([Word("зафиксируем", 9.5, 10.0)])
+    # '?' is emitted for 'встреча' (end 9.0) though two later words already
+    # landed. It must find 'встреча' by time, not fall on the last word.
+    store.attach_punct_at(9.1, "?")
+
+    assert store.all_text() == "встреча? Давайте зафиксируем"
+    assert store.size() == 3  # in place, indices intact
+
+
+def test_attach_punct_at_falls_back_to_closest_when_outside_tol():
+    from asr.events import Word
+    from store.transcript_store import TranscriptStore
+
+    store = TranscriptStore()
+    store.append([Word("привет", 0.0, 0.3), Word("мир", 0.4, 0.8)])
+    # A mark whose time is far past every word still lands, on the closest
+    # (last) word - it is never dropped.
+    store.attach_punct_at(50.0, ".")
+
+    assert store.all_text() == "привет мир."
 
 
 def _supervisor(**kwargs) -> CaptureSupervisor:

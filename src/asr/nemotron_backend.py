@@ -64,15 +64,17 @@ class WordAssembler:
         self,
         frame_sec: float,
         idle_flush_sec: float = IDLE_FLUSH_SEC,
-        on_late_punct: Optional[Callable[[str], None]] = None,
+        on_late_punct: Optional[Callable[[str, float], None]] = None,
     ) -> None:
         self._frame_sec = float(frame_sec)
         self._idle_frames = max(1, int(round(idle_flush_sec / self._frame_sec)))
         self._pending: Optional[_Pending] = None
-        # Called with punctuation that arrived after its word was already
-        # committed (this model emits sentence-final '.'/'?' ~1.5 s late, after
-        # the pause an idle/stale flush has already acted on). The backend
-        # turns it into an `amend` event instead of dropping it.
+        # Called with (punctuation, emission_time_sec) for a mark that arrived
+        # after its word was already committed (this model emits sentence-final
+        # '.'/'?' ~1.5 s late, after the pause an idle/stale flush has already
+        # acted on). The time is the mark's own emission frame in global stream
+        # seconds; the backend turns it into an `amend` event that binds by
+        # timestamp instead of dropping the mark or pinning it to the last word.
         self._on_late_punct = on_late_punct
 
     def push(self, piece: str, frame: int) -> List[Word]:
@@ -97,7 +99,7 @@ class WordAssembler:
             # gone from here, so hand the punctuation to the backend to append
             # onto the last committed word instead of dropping it.
             if self._on_late_punct is not None:
-                self._on_late_punct(text)
+                self._on_late_punct(text, frame * self._frame_sec)
             return done
         if opens_word or self._pending is None:
             self._pending = _Pending(text=text, start_frame=frame, end_frame=frame)
@@ -232,7 +234,7 @@ class NemotronBackend:
 
             assembler = WordAssembler(
                 self._frame_sec,
-                on_late_punct=lambda punct: self._amend(events, punct),
+                on_late_punct=lambda punct, time_sec: self._amend(events, punct, time_sec),
             )
             streamer = _WordStreamer(
                 model=self._model,
@@ -328,17 +330,23 @@ class NemotronBackend:
         except queue.Full:
             self._emit_log(events, "event queue full on commit; dropped")
 
-    def _amend(self, events: "queue.Queue[ASREvent]", punct: str) -> None:
-        """Append late punctuation to the last committed word.
+    def _amend(self, events: "queue.Queue[ASREvent]", punct: str, time_sec: float) -> None:
+        """Append late punctuation to the committed word it belongs to.
 
-        Emitted through the same queue as commits, so the splitter applies it
-        after the word it belongs to is already in the store.
+        Carries the mark's own emission time (global stream seconds) so the
+        splitter can bind it to the word whose end is closest, not blindly to
+        the last one - by the time the mark arrives 1-2 later words may have
+        committed. Emitted through the same queue as commits, so the target
+        word is already in the store when this is applied.
         """
         punct = punct.strip()
         if not punct:
             return
         try:
-            events.put(ASREvent(type="amend", source="engine", text=punct), timeout=0.5)
+            events.put(
+                ASREvent(type="amend", source="engine", text=punct, time_sec=time_sec),
+                timeout=0.5,
+            )
         except queue.Full:
             self._emit_log(events, "event queue full on amend; dropped")
 

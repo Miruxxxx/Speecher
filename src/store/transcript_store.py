@@ -93,6 +93,40 @@ class TranscriptStore:
                 ts,
             )
 
+    def attach_punct_at(self, time_sec: float, suffix: str, tol: float = 2.0) -> None:
+        """Append `suffix` to the word whose end is closest to `time_sec`.
+
+        Nemotron emits sentence-final '.'/'?' ~1.5 s after the word it closes,
+        by which point 1-2 later words are already committed, so the mark can't
+        just go on the last entry. It carries its own emission timestamp and
+        lands on the word it acoustically belongs to. Edits text in place, so
+        the entry count and every index stay put - safe for the same reason
+        `update_word_texts` is. `tol` only bounds the backward scan; if nothing
+        falls inside it the closest word still gets the mark (never dropped).
+        """
+        if not suffix:
+            return
+        with self._lock:
+            if not self._entries:
+                return
+            best_i = len(self._entries) - 1
+            best_dist = abs(self._entries[best_i][0].end - time_sec)
+            # Punctuation is always recent, so walk back over the tail only and
+            # stop once words end well before the mark - older ones can't win.
+            for i in range(len(self._entries) - 2, -1, -1):
+                w = self._entries[i][0]
+                dist = abs(w.end - time_sec)
+                if dist < best_dist:
+                    best_dist = dist
+                    best_i = i
+                if w.end < time_sec - tol:
+                    break
+            old_word, ts = self._entries[best_i]
+            self._entries[best_i] = (
+                Word(text=old_word.text + suffix, start=old_word.start, end=old_word.end),
+                ts,
+            )
+
     def update_word_texts(self, start_index: int, new_texts: list[str]) -> None:
         with self._lock:
             if start_index + len(new_texts) > len(self._entries):
