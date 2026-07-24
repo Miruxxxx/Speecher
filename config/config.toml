@@ -12,7 +12,7 @@ restart_backoff_sec = 2.0     # пауза перед перезапуском �
 [asr]
 # whisper (дефолт) | nemotron (стриминговый, требует cu128-torch + transformers>=5.13);
 # неизвестное значение → whisper
-engine = "whisper"
+engine = "nemotron"
 # tiny/base/small/medium/large-v3, либо полный HF repo id.
 # large-v3-turbo указан явным репозиторием: короткий алиас в faster-whisper 1.2
 # ведёт на dropbox-dash/*, а этот вариант уже лежит в локальном кэше.
@@ -64,7 +64,12 @@ max_tokens = 2048
 request_timeout_sec = 120.0
 health_timeout_sec = 2.0      # таймаут проверки доступности сервера
 max_summary_chars = 6000      # лимит символов транскрипта в промпте саммари (лишнее с начала отбрасывается)
-qwen_no_think = true          # подставлять /no_think (Qwen3-специфика)
+# Сколько модели позволено «думать» перед ответом (OpenAI-совместимый
+# reasoning_effort). "none" — думать запрещено, "" — поле не отправлять.
+# Проверено на LM Studio + qwen3.5-9b: работает только "none". Со включённым
+# размышлением ответ уходит в reasoning_content, съедает весь max_tokens и
+# наружу приходит ПУСТО. Старый /no_think новый LM Studio игнорирует.
+reasoning_effort = "none"
 
 [ui]
 max_recent_chars = 700
