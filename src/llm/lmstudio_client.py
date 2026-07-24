@@ -72,28 +72,24 @@ class LMStudioClient:
             "content": "You are a helpful, concise assistant.",
         }
 
-    @staticmethod
-    def _inject_no_think(messages: list) -> list:
-        """Prepend /no_think to the first user message so Qwen3 skips chain-of-thought."""
-        out = []
-        done = False
-        for msg in messages:
-            if not done and msg.get("role") == "user":
-                out.append({**msg, "content": "/no_think " + msg["content"]})
-                done = True
-            else:
-                out.append(msg)
-        return out
-
     def _prepare(self, messages: List[dict], include_system: bool) -> List[dict]:
         all_messages: List[dict] = []
         if include_system:
             all_messages.append(self._system_message())
-        if self._cfg.qwen_no_think:
-            all_messages.extend(self._inject_no_think(messages))
-        else:
-            all_messages.extend(messages)
+        all_messages.extend(messages)
         return all_messages
+
+    def _extra(self) -> dict:
+        """Request fields beyond the standard ones.
+
+        `reasoning_effort` is how a reasoning model is told not to think. It
+        matters more than it looks: with thinking on, LM Studio streams the
+        chain-of-thought in `delta.reasoning_content` (never in `content`), and
+        on a long prompt it exhausts `max_tokens` before answering — the stream
+        ends with finish_reason="length" and the caller gets an empty string.
+        """
+        effort = (self._cfg.reasoning_effort or "").strip()
+        return {"reasoning_effort": effort} if effort else {}
 
     # ------------------------------------------------------------------
     # Вызовы
@@ -117,15 +113,26 @@ class LMStudioClient:
             temperature=temperature if temperature is not None else self._cfg.temperature,
             max_tokens=max_tokens if max_tokens is not None else self._cfg.max_tokens,
             stream=True,
+            **self._extra(),
         )
+        produced = False
+        finish: Optional[str] = None
         for chunk in stream:
             # Some OpenAI-compatible servers send a final chunk with an empty
             # choices list (usage-only); indexing it blindly would raise.
             if not chunk.choices:
                 continue
-            delta = chunk.choices[0].delta.content
+            choice = chunk.choices[0]
+            if choice.finish_reason:
+                finish = choice.finish_reason
+            # Only `content` is the answer. A reasoning model's chain-of-thought
+            # arrives in `delta.reasoning_content` and is deliberately dropped.
+            delta = choice.delta.content
             if delta:
+                produced = True
                 yield delta
+        if not produced:
+            raise RuntimeError(self._empty_answer_reason(finish))
 
     def complete(
         self,
@@ -145,5 +152,21 @@ class LMStudioClient:
             temperature=temperature if temperature is not None else self._cfg.temperature,
             max_tokens=max_tokens if max_tokens is not None else self._cfg.max_tokens,
             stream=False,
+            **self._extra(),
         )
-        return (response.choices[0].message.content or "").strip()
+        choice = response.choices[0]
+        text = (choice.message.content or "").strip()
+        if not text:
+            raise RuntimeError(self._empty_answer_reason(choice.finish_reason))
+        return text
+
+    @staticmethod
+    def _empty_answer_reason(finish_reason: Optional[str]) -> str:
+        """Turn a silently-empty answer into something diagnosable."""
+        if finish_reason == "length":
+            return (
+                "модель израсходовала max_tokens на размышления и не дала ответ — "
+                'поставьте llm.reasoning_effort = "none" в config/config.toml '
+                "или поднимите llm.max_tokens"
+            )
+        return f"модель вернула пустой ответ (finish_reason={finish_reason!r})"

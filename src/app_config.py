@@ -100,8 +100,14 @@ class LlmConfig:
     # Cap on transcript chars sent in a summary prompt: past this the oldest
     # text is dropped so we never silently overflow a small local context.
     max_summary_chars: int = 6000
-    # Prepend /no_think for Qwen3-family models.
-    qwen_no_think: bool = True
+    # How much chain-of-thought the model may spend before answering, sent as
+    # the OpenAI-compatible `reasoning_effort`. "none" disables thinking
+    # entirely; "" omits the field (for servers/models that reject it).
+    # Measured against LM Studio + qwen3.5-9b (2026-07-24): only "none" works —
+    # "minimal", `chat_template_kwargs.enable_thinking=false` and the old
+    # `/no_think` prompt prefix all still produced pure reasoning, which ate
+    # the whole max_tokens budget and returned an EMPTY answer.
+    reasoning_effort: str = "none"
 
 
 @dataclass(slots=True)
