@@ -7,6 +7,7 @@ from pathlib import Path
 import numpy as np
 
 from audio.buffer import GrowingAudioBuffer
+from audio.capture_base import CAPTURE_ERROR, CAPTURE_LIVE, CAPTURE_SILENT
 from audio.rust_capture import DEFAULT_BINARY, RustCaptureSupervisor, resolve_binary
 
 FAKE = Path(__file__).with_name("fake_capture.py")
@@ -78,6 +79,38 @@ def test_audio_reaches_buffer_and_frame_sink(monkeypatch):
     texts = [ev.text for ev in drain(events)]
     assert any("Fake Endpoint" in t for t in texts), texts
     assert any("sr=48000" in t and "16000" in t for t in texts), texts
+
+
+def test_capture_state_tracks_sound_silence_and_failure(monkeypatch):
+    """What the overlay's capture indicator reads (design system 2.1 / 6.5).
+
+    The fake streams 0.5-valued samples, so "звук идёт" must appear while they
+    arrive and decay to "тишина" once they stop — silence is a normal mode, not
+    a fault. A child that keeps dying is the third state.
+    """
+    supervisor, audio_buffer, _, _ = make_supervisor(
+        "stream", monkeypatch, sound_hold_sec=0.2
+    )
+    assert supervisor.capture_state()[0] == CAPTURE_SILENT  # nothing heard yet
+    supervisor.start()
+    try:
+        assert wait_until(lambda: supervisor.capture_state()[0] == CAPTURE_LIVE)
+        # The fake sends a fixed burst and then goes quiet, like an idle endpoint.
+        assert wait_until(lambda: supervisor.capture_state()[0] == CAPTURE_SILENT)
+    finally:
+        supervisor.stop()
+
+
+def test_capture_state_reports_a_dying_child_as_an_error(monkeypatch):
+    supervisor, _, _, stop_event = make_supervisor(
+        "fatal", monkeypatch, restart_backoff_sec=0.5
+    )
+    supervisor.start()
+    try:
+        assert wait_until(lambda: supervisor.capture_state()[0] == CAPTURE_ERROR)
+        assert supervisor.capture_state()[1], "the tooltip needs a reason"
+    finally:
+        supervisor.stop()
 
 
 def test_a_sample_split_across_reads_is_not_lost(monkeypatch):

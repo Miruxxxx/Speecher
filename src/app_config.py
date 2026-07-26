@@ -6,6 +6,9 @@ from dataclasses import dataclass, field, fields, is_dataclass
 from pathlib import Path
 from typing import Any
 
+from translate import languages
+from translate.backends import KNOWN_BACKENDS as KNOWN_TRANSLATE_BACKENDS
+
 logger = logging.getLogger(__name__)
 
 # Backends `create_asr_backend` knows how to build. Anything else falls back
@@ -19,6 +22,7 @@ KNOWN_CAPTURE_SOURCES = ("loopback", "mic")
 # subsampled encoder frames. Latency is (n + 1) * 80 ms.
 NEMOTRON_LOOKAHEAD_TOKENS = (0, 3, 6, 13)
 NEMOTRON_DTYPES = ("float32", "float16", "bfloat16")
+
 
 
 @dataclass(slots=True)
@@ -98,9 +102,21 @@ class PunctuationConfig:
 
 @dataclass(slots=True)
 class LlmConfig:
-    base_url: str = "http://localhost:1234/v1"
-    # "" = use whatever model is loaded in LM Studio (first from /models).
+    # Which entry of src/llm/providers.py to talk to. Local servers need no
+    # key; a cloud provider's key lives outside this file entirely (it is in
+    # git) — see src/llm/credentials.py.
+    provider: str = "lmstudio"
+    # "" = the provider's own URL from the registry. Only `custom` requires it,
+    # but any provider can be pointed at a proxy this way.
+    base_url: str = ""
+    # The model to use. "" is resolved from /models for a *local* server only:
+    # picking one of a cloud provider's hundreds at random would answer with
+    # something arbitrary and bill for it.
     model: str = ""
+    # Per-provider memory, written by the settings window so switching provider
+    # and back does not lose the choice. Consulted only when `model` is empty,
+    # so a hand-edited `model` always wins.
+    models: dict = field(default_factory=dict)
     temperature: float = 0.6
     max_tokens: int = 2048
     request_timeout_sec: float = 120.0
@@ -119,9 +135,88 @@ class LlmConfig:
 
 
 @dataclass(slots=True)
+class TranslateConfig:
+    """Live translation (src/translate). Off by default: it loads a second
+    model onto the same GPU the ASR engine is using."""
+
+    # nllb (любой язык одной моделью) | opusmt (одна пара, быстрее) | off
+    backend: str = "nllb"
+    # Whether translation is on when the app starts; Alt+T flips it for the
+    # session without touching this file (same contract as the ⏺ toggle).
+    enabled: bool = False
+    # Target language code from src/translate/languages.py.
+    target: str = "ru"
+    # Show the original transcript in its own small window while translating.
+    # The main feed deliberately holds only finished lines, so without this
+    # there is a couple of seconds where nothing visibly happens.
+    show_source: bool = True
+    # "auto" = take the ASR's language, or guess from the script.
+    source: str = "auto"
+    # "" = the backend's own default checkpoint.
+    model: str = ""
+    device: str = "cuda"            # cuda | cpu
+    dtype: str = "float16"          # float16 | bfloat16 | float32 (cpu forces float32)
+    # The trailing words are cut into a line this long after the last one;
+    # until then they may still grow and the line would have to change.
+    close_after_sec: float = 1.5
+    # Silence between two words that ends a segment even mid-sentence.
+    pause_sec: float = 1.2
+    # Hard cap so speech without punctuation or pauses still reaches the screen.
+    max_words_per_segment: int = 40
+    # Segments allowed to wait before the worker merges them into one longer
+    # line to catch up (never dropped: the feed must stay in order).
+    max_pending: int = 4
+    poll_sec: float = 0.4
+    max_chars_per_chunk: int = 220
+    max_new_tokens: int = 256
+    # Skip a reply already written in the target language's script. Only used
+    # when the source language is unknown — see TranslationWorker._same_language.
+    skip_same_script: bool = True
+
+
+@dataclass(slots=True)
 class UiConfig:
     max_recent_chars: int = 700
     console_verbose_logs: bool = False
+    # Which of the two layout modes the window opens in (design system 3).
+    compact: bool = False
+    # Interval the "Выжимка" button and Alt+5 summarise, in minutes. The button
+    # caption is generated from this value, never written by hand (6.6);
+    # 0 means "не задан" and the button says so.
+    summary_interval_min: int = 5
+    # Run that summary automatically every interval and announce it.
+    auto_summary: bool = False
+    # Flipped to true after the onboarding window has been shown once (6.7).
+    onboarding_shown: bool = False
+
+
+@dataclass(slots=True)
+class HotkeysConfig:
+    """Global hotkeys (design system 5). Empty value = not registered.
+
+    Alt+Space is show/hide and nothing else; the ready-summary notification
+    uses Alt+H instead, which is how the mock-up's collision is resolved (6.4).
+    """
+
+    toggle_window: str = "Alt+Space"
+    toggle_recording: str = "Alt+R"
+    pause_recording: str = "Alt+P"
+    summary: str = "Alt+5"
+    answer: str = "Alt+Enter"
+    last_question: str = "Alt+Q"
+    history: str = "Alt+H"
+    translate: str = "Alt+T"
+
+
+@dataclass(slots=True)
+class StorageConfig:
+    """Transcript persistence (src/store/transcript_writer.py)."""
+
+    # Whether recording is on at startup. The overlay's ⏺ toggle flips it for
+    # the running session without touching this file.
+    enabled: bool = True
+    # Relative paths resolve against the project root, not the CWD.
+    dir: str = "storage/transcripts"
 
 
 @dataclass(slots=True)
@@ -131,6 +226,9 @@ class AppConfig:
     punctuation: PunctuationConfig = field(default_factory=PunctuationConfig)
     llm: LlmConfig = field(default_factory=LlmConfig)
     ui: UiConfig = field(default_factory=UiConfig)
+    hotkeys: HotkeysConfig = field(default_factory=HotkeysConfig)
+    storage: StorageConfig = field(default_factory=StorageConfig)
+    translate: TranslateConfig = field(default_factory=TranslateConfig)
 
 
 def _apply_section(obj: Any, data: dict, path: str) -> None:
@@ -174,6 +272,92 @@ def load_config(path: str | Path) -> AppConfig:
     return cfg
 
 
+def _format_value(value: Any) -> str:
+    if isinstance(value, bool):
+        return "true" if value else "false"
+    if isinstance(value, (int, float)):
+        return repr(value)
+    text = str(value).replace("\\", "\\\\").replace('"', '\\"')
+    return f'"{text}"'
+
+
+def save_overrides(path: str | Path, updates: dict[str, dict[str, Any]]) -> None:
+    """Write `{"section": {"key": value}}` back into config.toml in place.
+
+    Line-based on purpose: the file is the user's, full of Russian comments that
+    explain why each value is what it is, and a round-trip through a TOML
+    serialiser would delete every one of them. Only the value part of a matched
+    key is replaced; an unknown key is appended to its section, an unknown
+    section to the end of the file.
+
+    Raises OSError if the file cannot be written — the caller reports it.
+    """
+    p = Path(path)
+    lines = p.read_text(encoding="utf-8").splitlines() if p.exists() else []
+    remaining = {sec: dict(keys) for sec, keys in updates.items() if keys}
+
+    out: list[str] = []
+    section = ""
+    # Where each section ends, so a new key lands inside it rather than under
+    # the next header.
+    for raw in lines:
+        stripped = raw.strip()
+        if stripped.startswith("[") and stripped.endswith("]"):
+            _flush_section(out, section, remaining)
+            section = stripped[1:-1].strip()
+            out.append(raw)
+            continue
+        keys = remaining.get(section)
+        if keys and "=" in raw and not stripped.startswith("#"):
+            name = raw.split("=", 1)[0].strip()
+            if name in keys:
+                comment = ""
+                after = raw.split("=", 1)[1]
+                # Keep a trailing comment; '#' inside a quoted value is not one.
+                hash_pos = _comment_pos(after)
+                if hash_pos >= 0:
+                    comment = "  " + after[hash_pos:].strip()
+                out.append(f"{name} = {_format_value(keys.pop(name))}{comment}")
+                continue
+        out.append(raw)
+    _flush_section(out, section, remaining)
+
+    for section, keys in remaining.items():
+        if not keys:
+            continue
+        if out and out[-1].strip():
+            out.append("")
+        out.append(f"[{section}]")
+        for name, value in keys.items():
+            out.append(f"{name} = {_format_value(value)}")
+
+    p.parent.mkdir(parents=True, exist_ok=True)
+    p.write_text("\n".join(out) + "\n", encoding="utf-8")
+
+
+def _flush_section(out: list[str], section: str, remaining: dict[str, dict]) -> None:
+    """Append whatever is still unwritten for `section` before leaving it."""
+    keys = remaining.get(section)
+    if not keys:
+        return
+    while out and not out[-1].strip():
+        out.pop()
+    for name, value in keys.items():
+        out.append(f"{name} = {_format_value(value)}")
+    out.append("")
+    keys.clear()
+
+
+def _comment_pos(text: str) -> int:
+    in_string = False
+    for i, ch in enumerate(text):
+        if ch == '"':
+            in_string = not in_string
+        elif ch == "#" and not in_string:
+            return i
+    return -1
+
+
 def _normalize(cfg: AppConfig) -> None:
     """Fix up values that are the right type but not a valid choice."""
     source = cfg.audio.source.strip().lower()
@@ -209,3 +393,80 @@ def _normalize(cfg: AppConfig) -> None:
         )
         dtype = "float32"
     nem.dtype = dtype
+
+    _normalize_llm(cfg.llm)
+    _normalize_translate(cfg.translate)
+
+
+def _normalize_llm(llm: "LlmConfig") -> None:
+    # Imported here: providers.py must stay importable without the config, and
+    # the config must not drag the openai client in at load time.
+    from llm import providers
+
+    provider = llm.provider.strip().lower()
+    if providers.get(provider) is None:
+        logger.warning(
+            "config: llm.provider=%r is unknown (known: %s); using %r",
+            llm.provider, ", ".join(providers.ids()), providers.DEFAULT_PROVIDER,
+        )
+        provider = providers.DEFAULT_PROVIDER
+    llm.provider = provider
+
+    llm.models = {
+        str(k): str(v).strip() for k, v in (llm.models or {}).items() if str(v).strip()
+    }
+    if not llm.model.strip():
+        llm.model = llm.models.get(provider, "")
+
+
+def _normalize_translate(tr: "TranslateConfig") -> None:
+    """A translation setting that makes no sense turns the feature off or falls
+    back — never raises. It is an extra, and the transcript must run without it."""
+    backend = tr.backend.strip().lower()
+    if backend not in KNOWN_TRANSLATE_BACKENDS:
+        logger.warning(
+            "config: translate.backend=%r is unknown (known: %s); translation off",
+            tr.backend, ", ".join(KNOWN_TRANSLATE_BACKENDS),
+        )
+        backend = "off"
+    tr.backend = backend
+
+    target = languages.normalize_code(tr.target)
+    if not target:
+        logger.warning(
+            "config: translate.target=%r is not a supported language (known: %s); using 'ru'",
+            tr.target, ", ".join(languages.codes()),
+        )
+        target = "ru"
+    tr.target = target
+
+    # "auto" is a valid source and normalizes to "": the worker then asks the
+    # ASR language, and finally the script of the text itself.
+    source = tr.source.strip().lower()
+    if source not in ("", "auto"):
+        normalized = languages.normalize_code(source)
+        if not normalized:
+            logger.warning(
+                "config: translate.source=%r is not a supported language; using 'auto'",
+                tr.source,
+            )
+        source = normalized or "auto"
+    tr.source = source or "auto"
+
+    dtype = tr.dtype.strip().lower()
+    if dtype not in NEMOTRON_DTYPES:
+        logger.warning(
+            "config: translate.dtype=%r is unknown (allowed: %s); using 'float16'",
+            tr.dtype, ", ".join(NEMOTRON_DTYPES),
+        )
+        dtype = "float16"
+    tr.dtype = dtype
+
+    if tr.backend == "opusmt" and tr.source == "auto":
+        # A Marian checkpoint *is* a direction; there is nothing to load without
+        # both ends of it.
+        logger.warning(
+            "config: translate.backend='opusmt' needs a fixed translate.source "
+            "(a checkpoint exists per pair); translation off"
+        )
+        tr.backend = "off"

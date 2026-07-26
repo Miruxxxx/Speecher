@@ -4,6 +4,7 @@ import logging
 import queue
 import sys
 import threading
+from datetime import datetime
 from pathlib import Path
 
 from PyQt6.QtCore import QTimer
@@ -17,8 +18,13 @@ from asr.punctuation_worker import PunctuationWorker
 from audio.buffer import GrowingAudioBuffer
 from audio.rust_capture import RustCaptureSupervisor, resolve_binary
 from llm.engine import LLMEngine
-from llm.lmstudio_client import LMStudioClient
+from llm.openai_client import OpenAICompatClient
+from llm.summaries import SummaryHistory
 from store.transcript_store import TranscriptStore
+from store.transcript_writer import TranscriptWriter
+from translate.backends import create_backend as create_translation_backend
+from translate.store import TranslationStore
+from translate.worker import TranslationWorker
 from ui.output_sink import OutputSink
 from ui.overlay import Overlay
 from utils.latency import LatencyTracker
@@ -147,7 +153,36 @@ def main() -> None:
     audio_buffer = GrowingAudioBuffer(
         sample_rate=cfg.audio.target_sample_rate, max_seconds=cfg.asr.buffer_max_seconds
     )
-    store = TranscriptStore()
+
+    # Persistence hangs off the store, so words committed by the splitter and
+    # punctuation rewritten by nemotron/PunctuationWorker all reach the journal.
+    session_dir = Path(cfg.storage.dir)
+    if not session_dir.is_absolute():
+        session_dir = PROJECT_ROOT / session_dir
+    session_meta = {
+        # Computed here, not inside the writer, so the journal's meta line and
+        # the export header carry the same start time.
+        "started": datetime.now().isoformat(timespec="seconds"),
+        "engine": cfg.asr.engine,
+        "model": cfg.asr.nemotron.model if cfg.asr.engine == "nemotron" else cfg.asr.model,
+        "language": (
+            cfg.asr.nemotron.language if cfg.asr.engine == "nemotron" else cfg.asr.language
+        ),
+        "sample_rate": cfg.audio.target_sample_rate,
+    }
+    if cfg.translate.backend != "off":
+        session_meta["translate_target"] = cfg.translate.target
+    writer = TranscriptWriter(session_dir, meta=session_meta)
+    store = TranscriptStore(journal=writer)
+    # Same journal: a session file carries its translations, so resuming one
+    # does not re-run the model over text it already translated.
+    translations = TranslationStore(target=cfg.translate.target, journal=writer)
+    # Opened before the overlay is built so its ⏺ indicator renders the real
+    # state on the first frame rather than flipping a moment later.
+    if cfg.storage.enabled:
+        writer.start()
+    else:
+        logger.info("transcript journal off at startup: [storage] enabled = false")
 
     # Push-style backends read frames as they arrive; the pull-style whisper
     # path takes snapshots of audio_buffer and wants no queue at all.
@@ -166,6 +201,9 @@ def main() -> None:
         restart_backoff_sec=cfg.audio.restart_backoff_sec,
         latency=latency,
         frame_sink=frame_sink,
+        # The overlay's capture indicator reads "звук идёт" off this threshold,
+        # so it matches what the ASR silence gate would have decoded.
+        sound_rms_threshold=cfg.asr.filters.silence_rms_threshold,
     )
 
     sink = OutputSink(
@@ -174,16 +212,30 @@ def main() -> None:
         verbose_logs=cfg.ui.console_verbose_logs,
     )
 
-    llm = LLMEngine(LMStudioClient(cfg.llm))
+    llm = LLMEngine(OpenAICompatClient(cfg.llm))
+    summaries = SummaryHistory()
     overlay = Overlay(
-        events_queue=overlay_events,
-        store=store,
-        llm=llm,
-        max_recent_chars=cfg.ui.max_recent_chars,
-        max_summary_chars=cfg.llm.max_summary_chars,
+        overlay_events,
+        store,
+        llm,
+        cfg,
+        CONFIG_PATH,
+        writer=writer,
+        session_dir=session_dir,
+        capture=capture,
+        summaries=summaries,
+        translations=translations,
     )
+    overlay.set_session_meta(session_meta)
+    # A dying journal must surface in the UI, not only in the log: the ⏺ button
+    # is the user's only signal that recording is happening at all.
+    writer.set_error_handler(overlay.post_journal_error)
 
-    # When the overlay (last window) closes, stop everything.
+    # Shutdown is the overlay's alone: it closes -> app.quit() -> stop_event.
+    # Qt's implicit "last window closed" rule cannot be trusted here, because it
+    # does not count the overlay (a Qt.Tool) as a window at all — leaving it on
+    # means the first settings/about window to close ends the session.
+    app.setQuitOnLastWindowClosed(False)
     app.aboutToQuit.connect(stop_event.set)
 
     # Forward a fatal stop_event (set by engine/capture) into Qt's event loop.
@@ -232,6 +284,39 @@ def main() -> None:
     )
     loader_thread.start()
 
+    # Live translation. Its own thread and its own model: it must not share the
+    # LLM queue the answer/summary buttons use, and the model load is slow, so
+    # the worker loads it itself (a failure disables translation, nothing else).
+    translate_thread: threading.Thread | None = None
+    translate_backend = create_translation_backend(cfg.translate)
+    if translate_backend is not None:
+        translator = TranslationWorker(
+            store=store,
+            translations=translations,
+            backend=translate_backend,
+            stop_event=stop_event,
+            target=cfg.translate.target,
+            source=cfg.translate.source,
+            asr_language=(
+                cfg.asr.nemotron.language if cfg.asr.engine == "nemotron" else cfg.asr.language
+            ),
+            close_after_sec=cfg.translate.close_after_sec,
+            pause_sec=cfg.translate.pause_sec,
+            max_words_per_segment=cfg.translate.max_words_per_segment,
+            max_pending=cfg.translate.max_pending,
+            poll_sec=cfg.translate.poll_sec,
+            skip_same_script=cfg.translate.skip_same_script,
+            enabled=cfg.translate.enabled,
+            on_status=overlay.post_status,
+        )
+        overlay.set_translator(translator)
+        translate_thread = threading.Thread(
+            target=translator.run, name="translate", daemon=True
+        )
+        translate_thread.start()
+    else:
+        logger.info("live translation off: [translate] backend = %r", cfg.translate.backend)
+
     punct_thread: threading.Thread | None = None
     punct_backend = None
     if cfg.asr.engine == "nemotron":
@@ -263,7 +348,16 @@ def main() -> None:
     splitter_thread.join(timeout=2.0)
     if punct_thread is not None:
         punct_thread.join(timeout=2.0)
+    if translate_thread is not None:
+        # Longer than the others on purpose: a translation already inside the
+        # model cannot be interrupted, and its result still has to be journaled.
+        translate_thread.join(timeout=5.0)
     llm.stop()
+    # After the splitter and punctuation threads are joined, so nothing is still
+    # writing when the file closes.
+    writer.close()
+    if writer.path is not None and writer.path.exists():
+        print(f"Транскрипт сохранён: {writer.path}")
     print(latency.report())
 
     sys.exit(ret)

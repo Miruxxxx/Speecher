@@ -3,24 +3,100 @@ from __future__ import annotations
 import re
 import threading
 import time
-from typing import List, Optional, Tuple
+from typing import List, Optional, Protocol, Tuple
 
 from asr.events import Word
 
 
-class TranscriptStore:
-    """Thread-safe accumulator for committed ASR words with time-indexed queries."""
+class Journal(Protocol):
+    """Sink for store mutations (see store/transcript_writer.py)."""
 
-    def __init__(self) -> None:
+    def record(self, rec: dict) -> None: ...
+
+
+class TranscriptStore:
+    """Thread-safe accumulator for committed ASR words with time-indexed queries.
+
+    An optional `Journal` receives every mutation as a record dict. It is
+    attached here rather than to the producers because the store is the one
+    place all of them meet: the splitter's commits, nemotron's late punctuation
+    and the whisper PunctuationWorker's rewrites. Records describe the *applied*
+    result (resolved index + final text), so a replay reproduces this store
+    exactly. Journal calls happen after the lock is released — disk I/O must
+    never block a transcript read.
+    """
+
+    def __init__(self, journal: Optional[Journal] = None) -> None:
         self._lock = threading.Lock()
         self._entries: List[Tuple[Word, float]] = []  # (word, wall_clock_receive_time)
+        self._journal = journal
+
+    def set_journal(self, journal: Optional[Journal]) -> None:
+        self._journal = journal
+
+    def _emit(self, records: List[dict]) -> None:
+        if self._journal is None or not records:
+            return
+        for rec in records:
+            self._journal.record(rec)
 
     def append(self, words: List[Word]) -> None:
         t = time.time()
+        accepted = [w for w in words if w.text.strip()]
         with self._lock:
-            for w in words:
-                if w.text.strip():
-                    self._entries.append((w, t))
+            for w in accepted:
+                self._entries.append((w, t))
+        self._emit(
+            [{"t": "w", "text": w.text, "s": w.start, "e": w.end, "at": t} for w in accepted]
+        )
+
+    def load_entries(self, entries: List[Tuple[Word, float]]) -> int:
+        """Append words replayed from a previous session, keeping their original
+        receive times so `words_since_minutes` doesn't report them as just said.
+
+        Journaled like any other append, so the current session's file stays a
+        self-contained record of what the store holds.
+        """
+        accepted = [(w, t) for w, t in entries if w.text.strip()]
+        with self._lock:
+            self._entries.extend(accepted)
+        self._emit(
+            [{"t": "w", "text": w.text, "s": w.start, "e": w.end, "at": t} for w, t in accepted]
+        )
+        return len(accepted)
+
+    def snapshot(self) -> List[Word]:
+        """Every word currently held, in order — what the exports write out."""
+        with self._lock:
+            return [e[0] for e in self._entries]
+
+    def recent_entries(self, max_words: int) -> List[Tuple[Word, float]]:
+        """The last `max_words` (word, receive_time) pairs, oldest-first.
+
+        The overlay groups these into timestamped replies (ui/transcript_model);
+        it needs the receive times, and it needs only the tail — copying a
+        session's worth of entries at every repaint would get slower the longer
+        the session runs.
+        """
+        with self._lock:
+            if max_words <= 0 or max_words >= len(self._entries):
+                return list(self._entries)
+            return list(self._entries[-max_words:])
+
+    def entries_since(self, index: int) -> List[Tuple[Word, float]]:
+        """Everything from absolute `index` onward, oldest-first.
+
+        Index-addressed, unlike `recent_entries`, because the translation worker
+        must resume exactly where it stopped: a sliding window of the last N
+        words regroups as the store grows, and units cut from it are not stable
+        (which is precisely how the first version of the feature broke).
+        """
+        with self._lock:
+            if index <= 0:
+                return list(self._entries)
+            if index >= len(self._entries):
+                return []
+            return list(self._entries[index:])
 
     def all_text(self) -> str:
         with self._lock:
@@ -88,10 +164,13 @@ class TranscriptStore:
             if not self._entries:
                 return
             old_word, ts = self._entries[-1]
-            self._entries[-1] = (
-                Word(text=old_word.text + suffix, start=old_word.start, end=old_word.end),
+            index = len(self._entries) - 1
+            new_text = old_word.text + suffix
+            self._entries[index] = (
+                Word(text=new_text, start=old_word.start, end=old_word.end),
                 ts,
             )
+        self._emit([{"t": "patch", "i": index, "text": new_text}])
 
     def attach_punct_at(self, time_sec: float, suffix: str, tol: float = 2.0) -> None:
         """Append `suffix` to the word whose end is closest to `time_sec`.
@@ -122,18 +201,28 @@ class TranscriptStore:
                 if w.end < time_sec - tol:
                     break
             old_word, ts = self._entries[best_i]
+            new_text = old_word.text + suffix
             self._entries[best_i] = (
-                Word(text=old_word.text + suffix, start=old_word.start, end=old_word.end),
+                Word(text=new_text, start=old_word.start, end=old_word.end),
                 ts,
             )
+        self._emit([{"t": "patch", "i": best_i, "text": new_text}])
 
     def update_word_texts(self, start_index: int, new_texts: list[str]) -> None:
+        changed: list[dict] = []
         with self._lock:
             if start_index + len(new_texts) > len(self._entries):
                 return
             for i, text in enumerate(new_texts):
                 old_word, ts = self._entries[start_index + i]
+                if old_word.text == text:
+                    # The punctuation worker resubmits its whole 80-word window
+                    # every cycle; journaling the untouched majority would cost
+                    # hundreds of lines a minute for nothing.
+                    continue
                 self._entries[start_index + i] = (
                     Word(text=text, start=old_word.start, end=old_word.end),
                     ts,
                 )
+                changed.append({"t": "patch", "i": start_index + i, "text": text})
+        self._emit(changed)

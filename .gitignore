@@ -30,3 +30,7 @@ storage/transcripts/*
 
 # Claude Code (личные настройки, не коммитить)
 .claude/settings.local.json
+
+# API-ключи никогда не хранятся в дереве проекта (см. src/llm/credentials.py),
+# но правило на месте на случай, если кто-то поменяет путь хранилища.
+credentials.json

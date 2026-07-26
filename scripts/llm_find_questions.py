@@ -61,13 +61,13 @@ def main() -> None:
     transcript = args.file.read_text(encoding="utf-8") if args.file else SAMPLE
 
     from app_config import load_config
-    from llm.lmstudio_client import LMStudioClient
+    from llm.openai_client import OpenAICompatClient
 
     cfg = load_config(ROOT / "config" / "config.toml")
-    client = LMStudioClient(cfg.llm)
-    print(f"[llm] base_url: {cfg.llm.base_url}")
+    client = OpenAICompatClient(cfg.llm)
+    print(f"[llm] {client.provider.caption}: {client.base_url}")
     if not client.is_available():
-        print("[llm] LM Studio НЕ доступен — запусти сервер и загрузи модель, потом повтори.")
+        print(f"[llm] НЕ доступен: {client.unavailable_message()}")
         return
     print(f"[llm] model: {client.resolve_model()}")
     print("[llm] --- ответ модели (стрим) ---\n")

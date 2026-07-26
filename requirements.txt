@@ -13,7 +13,8 @@
 faster-whisper>=1.2.1
 PyQt6>=6.11.0
 numpy>=2.3
-openai>=2.34          # клиент для LM Studio (OpenAI-совместимый REST)
+openai>=2.34          # один клиент на все провайдеры (OpenAI-совместимый REST)
+keyring>=25.0         # API-ключи в диспетчере учётных данных Windows, не в config.toml
 torch>=2.11           # CUDA-сборка, см. шапку
 
 # --- Захват звука ---
@@ -34,6 +35,15 @@ accelerate>=1.14
 # Работает только для engine = "whisper" — nemotron пунктуирует сам.
 # Второго бэкенда больше нет: deepmultilingualpunctuation удалён в фазе 3
 # (нет русского, ~2.1 ГБ, тянет transformers ниже 5.13 и ломает nemotron).
+
+# --- Перевод на лету (config: [translate].backend) ---
+# nllb (дефолт): facebook/nllb-200-distilled-600M тянется с HF при первом
+# включении (~2.5 ГБ). Ничего ставить не надо — transformers и torch уже есть,
+# а токенизатор NLLB грузится из tokenizer.json, без sentencepiece.
+# opusmt (Helsinki-NLP/opus-mt-{src}-{tgt}, ~300 МБ на пару) — MarianTokenizer
+# требует двух пакетов, поэтому они НЕ в списке ниже, а ставятся по желанию:
+#   .venv\Scripts\python -m pip install sentencepiece sacremoses
+# Проверить модель вживую: .venv\Scripts\python scripts\translate_probe.py
 
 # --- Dev ---
 pytest>=8.0

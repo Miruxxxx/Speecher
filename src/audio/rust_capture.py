@@ -43,6 +43,24 @@ def resolve_binary(configured: str = "") -> Path:
     return path if path.is_absolute() else PROJECT_ROOT / path
 
 
+def list_devices(binary: Path | str, *, timeout: float = 15.0) -> dict[str, list[dict]]:
+    """Endpoints as WASAPI sees them: {"render": [...], "capture": [...]}.
+
+    The same `--list-devices` call scripts/list_audio_devices.py makes, so the
+    names the settings window offers are exactly the ones `device_hint` matches
+    against. Runs a subprocess — call it off the UI thread.
+    """
+    out = subprocess.run(
+        [str(binary), "--list-devices"],
+        capture_output=True,
+        timeout=timeout,
+        creationflags=_CREATE_NO_WINDOW,
+    )
+    if out.returncode != 0:
+        raise RuntimeError(out.stderr.decode("utf-8", "replace").strip() or "нет вывода")
+    return json.loads(out.stdout.decode("utf-8"))
+
+
 class RustCaptureSupervisor(CaptureSupervisorBase):
     """
     Runs native/audio_capture (WASAPI, Rust) as the capture child.
@@ -75,6 +93,8 @@ class RustCaptureSupervisor(CaptureSupervisorBase):
         restart_backoff_sec: float = 2.0,
         latency=None,
         frame_sink: "Optional[queue.Queue[np.ndarray]]" = None,
+        sound_rms_threshold: float = 1e-4,
+        sound_hold_sec: float = 0.8,
     ) -> None:
         super().__init__(
             audio_buffer=audio_buffer,
@@ -83,6 +103,8 @@ class RustCaptureSupervisor(CaptureSupervisorBase):
             restart_backoff_sec=restart_backoff_sec,
             latency=latency,
             frame_sink=frame_sink,
+            sound_rms_threshold=sound_rms_threshold,
+            sound_hold_sec=sound_hold_sec,
         )
         self._binary = Path(binary_path)
         self._device_hint = device_hint or ""

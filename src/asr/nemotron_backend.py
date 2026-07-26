@@ -9,6 +9,7 @@ from typing import Any, Callable, Iterator, List, Optional
 
 import numpy as np
 
+import heavy_imports
 from app_config import NemotronConfig
 from asr.events import ASREvent, Word
 
@@ -175,9 +176,12 @@ class NemotronBackend:
         self._status(f"Загружаю Nemotron ({cfg.model}, {cfg.device}/{cfg.dtype})…")
 
         # Heavy imports stay here: importing torch/transformers costs seconds
-        # and the whisper path must not pay for them.
-        import torch
-        from transformers import AutoModelForRNNT, AutoProcessor
+        # and the whisper path must not pay for them. Under the guard because
+        # the translation worker imports from the same lazy submodule at the
+        # same moment — see src/heavy_imports.py.
+        with heavy_imports.transformers():
+            import torch
+            from transformers import AutoModelForRNNT, AutoProcessor
 
         processor = AutoProcessor.from_pretrained(cfg.model)
         processor.set_num_lookahead_tokens(cfg.lookahead_tokens)

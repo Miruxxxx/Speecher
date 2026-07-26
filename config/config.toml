@@ -5,7 +5,7 @@
 [audio]
 # Звук захватывает нативный бинарь native/audio_capture (WASAPI, Rust).
 # Собрать: cargo build --release --manifest-path native/audio_capture/Cargo.toml
-device_hint = "HyperX"        # подстрока имени устройства ВЫВОДА (его слушаем в loopback)
+device_hint = "HyperX"  # подстрока имени устройства ВЫВОДА (его слушаем в loopback)
 target_sample_rate = 16000
 restart_backoff_sec = 2.0     # пауза перед перезапуском упавшего capture-процесса
 source = "loopback"           # loopback | mic (mic — задел на двухдорожечный режим)
@@ -49,7 +49,7 @@ model = "nvidia/nemotron-3.5-asr-streaming-0.6b"
 device = "cuda"               # cuda | cpu
 dtype = "float32"             # float32 | float16 | bfloat16 (fp16 экономит VRAM, но декодирует вдвое медленнее)
 lookahead_tokens = 6          # 0 | 3 | 6 | 13 → задержка 80/320/560/1120 мс
-language = "auto"             # "auto" | "ru" | "en-US" | ... (локали модели)
+language = "auto"  # "auto" | "ru" | "en-US" | ... (локали модели)
 
 [punctuation]
 # Работает только при engine = "whisper": nemotron пунктуирует сам.
@@ -59,8 +59,18 @@ interval_sec = 12.0
 context_words = 80
 
 [llm]
-base_url = "http://localhost:1234/v1"
-model = ""                    # "" = первая загруженная в LM Studio модель
+# Кто отвечает на «Ответить» и делает «Выжимку». Список — src/llm/providers.py:
+#   локально: lmstudio, ollama
+#   облако:   openrouter, openai, anthropic, google, deepseek, groq, mistral,
+#             xai, together, fireworks, cerebras, deepinfra
+#   custom:   свой OpenAI-совместимый сервер (тогда обязателен base_url)
+# ВАЖНО: API-ключ сюда НЕ пишется — этот файл в гите. Ключ хранится в
+# диспетчере учётных данных Windows (или %APPDATA%\Speecher\credentials.json),
+# задаётся в окне настроек. Также читается переменная окружения провайдера
+# (OPENAI_API_KEY, ANTHROPIC_API_KEY, …), если ключ нигде не сохранён.
+provider = "google"
+base_url = ""                 # "" = адрес провайдера из реестра; нужен только для custom
+model = "models/gemini-2.5-flash"  # "" = у локального сервера берётся загруженная модель
 temperature = 0.6
 max_tokens = 2048
 request_timeout_sec = 120.0
@@ -73,6 +83,72 @@ max_summary_chars = 6000      # лимит символов транскрипт
 # наружу приходит ПУСТО. Старый /no_think новый LM Studio игнорирует.
 reasoning_effort = "none"
 
+# Запомненная модель по каждому провайдеру — пишется окном настроек, чтобы
+# переключение туда-обратно не теряло выбор. Читается только когда model = "".
+[llm.models]
+anthropic = "claude-opus-5"
+deepseek = "deepseek-chat"
+google = "models/gemini-2.5-flash"
+
+[translate]
+# «Перевод на лету» работает как субтитры: речь режется на сегменты
+# (предложение / пауза / предел слов), сегмент переводится целиком и падает в
+# ленту ГОТОВОЙ строкой. Строка, попавшая в ленту, больше не меняется — ничего
+# не гаснет, не подменяется и не перевёрстывается задним числом.
+# Оригинал идёт своей обычной лентой в отдельном маленьком окне «Оригинал»
+# (show_source): строки в нём остаются и прокручиваются, ничего не пропадает.
+# Он же целиком остаётся в сторе, журнале и экспорте. Перевод локальный, LM Studio не участвует — очередь кнопок
+# «Ответить» и «Выжимка» остаётся свободной.
+backend = "nllb"      # nllb (любой язык одной моделью, ~2.5 ГБ) | opusmt (одна пара, ~300 МБ) | off
+enabled = true  # включён ли перевод на старте; Alt+T переключает на ходу
+target = "en"  # язык перевода: ru en de es fr it pt cs pl uk zh ja
+show_source = true    # показывать окно с живым оригиналом, пока перевод включён
+# "auto" = взять язык у ASR, а если и там auto — угадать по алфавиту текста.
+# Для backend = "opusmt" язык-источник обязателен: чекпойнт существует на пару.
+source = "auto"
+model = ""            # "" = facebook/nllb-200-distilled-600M (или Helsinki-NLP/opus-mt-{src}-{tgt})
+device = "cuda"       # cuda | cpu
+dtype = "float16"     # float16 | bfloat16 | float32; на cpu всегда float32
+close_after_sec = 1.5 # столько тишины после последнего слова — и хвост режется в строку
+pause_sec = 1.2       # пауза между словами, обрывающая сегмент даже посреди фразы
+max_words_per_segment = 40  # предел на случай речи без пунктуации и пауз
+max_pending = 4       # больше сегментов в очереди не копим: сливаем в одну строку, чтобы догнать
+poll_sec = 0.4
+max_chars_per_chunk = 220  # длинный сегмент режется по предложениям: модели переводят предложение
+max_new_tokens = 256
+skip_same_script = true    # не переводить текст, уже написанный алфавитом целевого языка
+
 [ui]
 max_recent_chars = 700
 console_verbose_logs = false  # показывать log-события движка в консоли
+# Раскладка по дизайн-системе (docs/DESIGN_SYSTEM.md §3): обычный режим
+# 600 × 340, компактный 360 × 200. Двойной клик по титульной строке переключает.
+compact = false
+# Интервал кнопки «Выжимка» и хоткея Alt+5, в минутах. Подпись кнопки («за 5
+# минут») собирается из этого значения, руками её писать нельзя (§6.6).
+# 0 = интервал не задан: кнопка выжимает всю сессию и честно об этом пишет.
+summary_interval_min = 5
+auto_summary = false  # делать выжимку по интервалу автоматически
+onboarding_shown = true   # окно приветствия показывается один раз
+
+[hotkeys]
+# Глобальные хоткеи (§5). Регистрируются через RegisterHotKey; занятую
+# комбинацию приложение переживает — действие остаётся на кнопке, а поле
+# в настройках подсвечивается «занято другим приложением».
+# Пустая строка = не регистрировать.
+toggle_window = "Alt+Space"  # показать/скрыть окно — и только это (§6.4)
+toggle_recording = "Alt+R"
+pause_recording = "Alt+P"
+summary = "Alt+5"  # выжимка за summary_interval_min
+answer = "Alt+Enter"
+last_question = "Alt+Q"
+history = "Alt+H"  # история выжимок / готовая выжимка
+translate = "Alt+T"  # перевод на лету вкл/выкл (только на эту сессию)
+
+[storage]
+# Персист транскрипта: JSONL, одна строка на слово, плюс строки-патчи на
+# правки пунктуации. Пишется через flush() сразу — падение процесса не теряет
+# записанное. В оверлее есть переключатель ⏺: он включает/выключает запись на
+# ходу, не трогая этот файл. Пустая сессия свой файл удаляет.
+enabled = true
+dir = "storage/transcripts"   # относительный путь считается от корня проекта

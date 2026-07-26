@@ -9,6 +9,14 @@ import numpy as np
 
 from asr.events import ASREvent
 
+# What the UI's capture indicator can show (design system 2.1 / 6.5): a wave
+# when audio is flowing, a flat line in silence, a struck-through line on error.
+# Silence is a normal mode, not a failure: WASAPI loopback delivers nothing at
+# all while no application renders audio.
+CAPTURE_LIVE = "live"
+CAPTURE_SILENT = "silent"
+CAPTURE_ERROR = "error"
+
 
 class CaptureSupervisorBase:
     """Restart policy and event plumbing shared by both capture backends.
@@ -40,6 +48,8 @@ class CaptureSupervisorBase:
         restart_backoff_sec: float = 2.0,
         latency=None,
         frame_sink: "Optional[queue.Queue[np.ndarray]]" = None,
+        sound_rms_threshold: float = 1e-4,
+        sound_hold_sec: float = 0.8,
     ) -> None:
         self._buffer = audio_buffer
         self._events = events
@@ -51,6 +61,16 @@ class CaptureSupervisorBase:
 
         self._thread: Optional[threading.Thread] = None
         self._local_stop = threading.Event()
+
+        # Capture state for the UI indicator. Written by the supervisor thread,
+        # read by the Qt thread; a str/float attribute swap is atomic under the
+        # GIL and a tick of staleness costs nothing at a 50 ms poll, so this
+        # deliberately takes no lock (locking here would sit in the audio path).
+        self._sound_rms_threshold = float(sound_rms_threshold)
+        self._sound_hold_sec = float(sound_hold_sec)
+        self._last_sound_at = 0.0        # monotonic; 0 = nothing heard yet
+        self._child_phase = "starting"   # starting | running | restarting | fatal
+        self._last_reason = ""
 
     # -- lifecycle ------------------------------------------------------
 
@@ -78,9 +98,12 @@ class CaptureSupervisorBase:
         try:
             while not self._stopping():
                 started_at = time.monotonic()
+                self._child_phase = "running"
                 clean_info = self._run_one_child()
                 if self._stopping():
                     break
+                self._child_phase = "restarting"
+                self._last_reason = str(clean_info)
 
                 lived_sec = time.monotonic() - started_at
                 if lived_sec < self._FAST_FAIL_SEC:
@@ -88,6 +111,7 @@ class CaptureSupervisorBase:
                 else:
                     fast_fails = 0
                 if fast_fails >= self._FAST_FAIL_LIMIT:
+                    self._child_phase = "fatal"
                     self._emit_fatal(
                         f"capture child failed {fast_fails} times within "
                         f"{self._FAST_FAIL_SEC:.0f}s of start (last: {clean_info}); giving up"
@@ -121,9 +145,27 @@ class CaptureSupervisorBase:
         """Publish one mono chunk at the target rate."""
         if not len(audio):
             return
+        # One pass for the indicator before the chunk leaves this thread. The
+        # threshold is the same one the ASR silence gate uses, so "звук идёт" in
+        # the UI means exactly "loud enough that the engine would decode it".
+        rms = float(np.sqrt(np.dot(audio, audio) / len(audio)))
+        if rms > self._sound_rms_threshold:
+            self._last_sound_at = time.monotonic()
         self._buffer.write(audio)
         if self._frame_sink is not None:
             self._push_frame(audio)
+
+    def capture_state(self) -> tuple[str, str]:
+        """(state, reason) for the UI indicator. Safe to call from any thread."""
+        phase = self._child_phase
+        if phase in ("restarting", "fatal"):
+            return CAPTURE_ERROR, self._last_reason
+        if phase == "starting":
+            return CAPTURE_SILENT, ""
+        last = self._last_sound_at
+        if last and time.monotonic() - last <= self._sound_hold_sec:
+            return CAPTURE_LIVE, ""
+        return CAPTURE_SILENT, ""
 
     def _push_frame(self, audio: np.ndarray) -> None:
         """Hand the mono/resampled chunk to a push-style ASR backend.
