@@ -20,6 +20,7 @@ models/
 # Локальные данные
 storage/transcripts/*
 !storage/transcripts/.gitkeep
+storage/logs/
 
 # Логи
 *.log

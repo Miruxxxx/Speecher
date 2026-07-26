@@ -17,6 +17,7 @@ from asr.punctuation_backends import create_backend
 from asr.punctuation_worker import PunctuationWorker
 from audio.buffer import GrowingAudioBuffer
 from audio.rust_capture import RustCaptureSupervisor, resolve_binary
+import logging_setup
 from llm.engine import LLMEngine
 from llm.openai_client import OpenAICompatClient
 from llm.summaries import SummaryHistory
@@ -128,6 +129,10 @@ def _load_asr_pipeline(
         pipeline.engine_thread.start()
         overlay.post_status("")
         model = cfg.asr.nemotron.model if backend.name == "nemotron" else cfg.asr.model
+        # The session header was written with the *configured* engine before the
+        # model had tried to load. Correct it now that the truth is known — the
+        # export and the journal must not name an engine that produced nothing.
+        overlay.set_engine(backend.name, model, requested=cfg.asr.engine)
         logger.info("ASR engine started (backend=%s, model=%s)", backend.name, model)
     except Exception as exc:
         logger.exception("ASR pipeline failed to load")
@@ -135,10 +140,12 @@ def _load_asr_pipeline(
 
 
 def main() -> None:
-    logging.basicConfig(
-        level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s"
-    )
+    # Read the config before logging is set up: it says where the log goes.
+    # Anything that fails in load_config reports itself through the root
+    # logger's default handler, which is enough for a file that cannot parse.
     cfg = load_config(CONFIG_PATH)
+    log_path = logging_setup.setup(cfg.logging)
+    logging_setup.banner(log_path, CONFIG_PATH)
 
     app = QApplication(sys.argv)
 

@@ -71,6 +71,31 @@ class TranscriptWriter:
         self._failed = False
         self._failure: Optional[str] = None
 
+    def update_meta(self, **fields) -> None:
+        """Correct the session header after the fact.
+
+        The meta line is written when recording starts, but the truth about
+        which ASR engine actually runs is only known a couple of seconds later,
+        once the model has loaded or failed and fallen back. Writing the
+        *configured* engine and leaving it there means every exported
+        transcript names an engine that may not have produced a word of it.
+
+        Replay takes the **last** meta record it sees (`store/session_io.py`),
+        so appending a corrected one is enough — no new record type, no journal
+        version bump, and an older reader still gets a valid header.
+        """
+        if not fields:
+            return
+        with self._lock:
+            self._meta.update(fields)
+            if self._fh is None:
+                return  # not recording; the next start() writes the merged meta
+            self._write_locked({
+                "t": "meta",
+                "version": JOURNAL_VERSION,
+                **self._meta,
+            })
+
     def set_error_handler(self, handler: Callable[[str], None]) -> None:
         """Install (or replace) the failure callback.
 
@@ -123,10 +148,15 @@ class TranscriptWriter:
                 self._fail(f"не удалось открыть {self._path}: {exc}")
                 return False
             if first_open:
+                # Kept in _meta rather than only in the record: update_meta
+                # rewrites the whole header, and a correction must not drop the
+                # start time when the caller did not supply one.
+                self._meta.setdefault(
+                    "started", datetime.now().isoformat(timespec="seconds")
+                )
                 self._write_locked({
                     "t": "meta",
                     "version": JOURNAL_VERSION,
-                    "started": datetime.now().isoformat(timespec="seconds"),
                     **self._meta,
                 })
             else:

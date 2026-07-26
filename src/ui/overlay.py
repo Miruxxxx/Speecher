@@ -170,6 +170,10 @@ class Overlay(QWidget):
         self._source_dismissed = False
         # Reset whenever translation is switched on; see _warn_if_nothing_to_translate.
         self._skip_warned = False
+        # Filled by the loader once the model is up; "" until then. The
+        # requested one is kept only when it differs — i.e. after a fallback.
+        self._engine_actual = ""
+        self._engine_requested = ""
 
         self._max_recent_chars = cfg.ui.max_recent_chars
         self._max_summary_chars = cfg.llm.max_summary_chars
@@ -609,12 +613,51 @@ class Overlay(QWidget):
         """Engine/model info for the export header. Any thread (dict swap)."""
         self._session_meta = dict(meta)
 
+    def set_engine(self, actual: str, model: str, *, requested: str = "") -> None:
+        """Record which ASR engine is really running. Called from the loader.
+
+        Until this existed the session header carried the *configured* engine,
+        written before the model had even tried to load — so after a fallback
+        every exported transcript named an engine that produced none of it. The
+        journal header is corrected too (TranscriptWriter.update_meta), and the
+        session menu grows a line saying what is actually running, because the
+        status message that announced the fallback is gone in seconds.
+        """
+        self._engine_actual = actual
+        self._engine_requested = requested if requested and requested != actual else ""
+        fields = {"engine": actual, "model": model}
+        if self._engine_requested:
+            fields["engine_requested"] = self._engine_requested
+        self._session_meta.update(fields)
+        if self._writer is not None:
+            self._writer.update_meta(**fields)
+
+    def _engine_caption(self) -> str:
+        if self._engine_requested:
+            return f"Движок: {self._engine_actual} (вместо {self._engine_requested})"
+        return f"Движок: {self._engine_actual}"
+
     def _on_session_menu(self) -> None:
         menu = QMenu(self)
         menu.setStyleSheet(menu_qss())
         menu.setMinimumWidth(_MENU_MIN_W)
 
         has_words = self._store.size() > 0
+
+        # Which engine is actually running. A disabled row, like the broken
+        # journal below: this is the state of the session, not a control. It
+        # exists because the fallback used to be announced only by a status
+        # message that clears itself, and the app then ran for hours on an
+        # engine the user had not chosen.
+        if self._engine_actual:
+            act_engine = menu.addAction(self._engine_caption())
+            act_engine.setEnabled(False)
+            if self._engine_requested:
+                act_engine.setToolTip(
+                    f"{self._engine_requested} не загрузился — причина в логе"
+                )
+            menu.addSeparator()
+
         # The journal toggle has to live somewhere clickable: the disk pill is an
         # indicator, not a control, and Alt+R is not guaranteed — Windows may
         # already own the combination.

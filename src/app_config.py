@@ -220,6 +220,23 @@ class StorageConfig:
 
 
 @dataclass(slots=True)
+class LoggingConfig:
+    """Where the app leaves a trace of itself.
+
+    Until this existed logging went to stderr only, which means a run started
+    from a shortcut left nothing at all — and the things that go wrong here are
+    slow and quiet (an engine that fell back, a journal that died, a key that
+    stopped working), so "reproduce it with a console open" is not a plan.
+    """
+
+    # "" = console only. Relative paths resolve against the project root.
+    dir: str = "storage/logs"
+    # Small on purpose: this is a diagnostic tail, not an archive.
+    max_bytes: int = 2_000_000
+    backups: int = 3
+
+
+@dataclass(slots=True)
 class AppConfig:
     audio: AudioConfig = field(default_factory=AudioConfig)
     asr: AsrConfig = field(default_factory=AsrConfig)
@@ -229,6 +246,7 @@ class AppConfig:
     hotkeys: HotkeysConfig = field(default_factory=HotkeysConfig)
     storage: StorageConfig = field(default_factory=StorageConfig)
     translate: TranslateConfig = field(default_factory=TranslateConfig)
+    logging: LoggingConfig = field(default_factory=LoggingConfig)
 
 
 def _apply_section(obj: Any, data: dict, path: str) -> None:
