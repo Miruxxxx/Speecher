@@ -336,7 +336,7 @@ assets/fonts/       IBM Plex Sans (Regular/Italic/Medium/SemiBold) + Mono, OFL
 ### Проверка
 
 ```powershell
-.venv\Scripts\python -m pytest tests/ -q          # 298 тестов
+.venv\Scripts\python -m pytest tests/ -q          # 309 тестов
 ```
 
 Из них по дизайн-системе: `test_design_tokens.py` (значения токенов + отсутствие
