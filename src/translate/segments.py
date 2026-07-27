@@ -70,9 +70,14 @@ def cut(
     """
     segments: List[Segment] = []
     buf: List[Tuple[Word, float]] = []
-    start_at = first_index
+    # Absolute index of buf[0], derived from the entry's own offset rather than
+    # accumulated from segment lengths. The accumulating form was off by one per
+    # skipped blank below, and a segment index that drifts is not a cosmetic
+    # bug: it is the key the `tr` journal records and TranslationStore.load use
+    # to put a translation back on the words it belongs to.
+    buf_start = first_index
 
-    for i, (word, received) in enumerate(entries):
+    for offset, (word, received) in enumerate(entries):
         text = word.text.strip()
         if not text:
             continue
@@ -81,17 +86,17 @@ def cut(
             # The boundary belongs *before* this word: the previous one ended a
             # sentence, or this one starts after a silence.
             if _sentence_over(buf[-1][0].text) or gap >= pause_sec:
-                segments.append(_make(buf, start_at))
-                start_at += len(buf)
+                segments.append(_make(buf, buf_start))
                 buf = []
+        if not buf:
+            buf_start = first_index + offset
         buf.append((word, received))
         if len(buf) >= max_words:
-            segments.append(_make(buf, start_at))
-            start_at += len(buf)
+            segments.append(_make(buf, buf_start))
             buf = []
 
     if buf and tail_closed:
-        segments.append(_make(buf, start_at))
+        segments.append(_make(buf, buf_start))
     return segments
 
 

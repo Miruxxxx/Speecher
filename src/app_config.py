@@ -23,6 +23,16 @@ KNOWN_CAPTURE_SOURCES = ("loopback", "mic")
 NEMOTRON_LOOKAHEAD_TOKENS = (0, 3, 6, 13)
 NEMOTRON_DTYPES = ("float32", "float16", "bfloat16")
 
+# Precision the translation model loads at. Deliberately its own tuple rather
+# than a reuse of NEMOTRON_DTYPES: the two are unrelated settings that happen to
+# accept the same three names today, and sharing the constant means narrowing
+# one engine's options would silently narrow the other's.
+TRANSLATE_DTYPES = ("float32", "float16", "bfloat16")
+
+# Where the translation model may load. "auto" asks utils.vram whether it fits
+# beside the ASR engine and falls back to CPU when it does not.
+TRANSLATE_DEVICES = ("auto", "cuda", "cpu")
+
 
 
 @dataclass(slots=True)
@@ -59,9 +69,14 @@ class NemotronConfig:
 
     model: str = "nvidia/nemotron-3.5-asr-streaming-0.6b"
     device: str = "cuda"            # cuda | cpu
-    # float32 by default on purpose: fp16 halves VRAM but decodes ~2x slower
-    # (greedy RNN-T is a loop over frames, conversion overhead dominates).
-    dtype: str = "float32"          # float32 | float16 | bfloat16
+    # fp16: half the VRAM (1217 MiB of weights against 2436) at no cost in
+    # speed. The previous default was float32 on the belief that fp16 "decodes
+    # ~2x slower"; measured on probe.wav (64 s of real speech, 3 runs each) the
+    # median per-chunk decode is 37.8-39.1 ms for fp16 against 43.2-44.3 ms for
+    # fp32 — fp16 is if anything faster, and the transcripts match. RTF is ~0.08
+    # either way, so the engine has ~12x headroom and precision is free to pick
+    # on memory alone.
+    dtype: str = "float16"          # float32 | float16 | bfloat16
     # Right attention context; latency is (n + 1) * 80 ms.
     lookahead_tokens: int = 6
     # "auto" lets the model detect the language per stream; a locale ("ru",
@@ -95,9 +110,21 @@ class AsrConfig:
 @dataclass(slots=True)
 class PunctuationConfig:
     backend: str = "silero"   # silero | off (unknown → off with a warning)
-    language: str = "ru"      # silero supports ru/en/de/es
+    # "auto" follows the script of the text itself, which is the only setting
+    # that survives `asr.language = "auto"`: a fixed "ru" here punctuates English
+    # speech with a Russian model and quietly makes the feature harmful.
+    # Otherwise a fixed code — silero-te covers ru/en/de/es.
+    language: str = "auto"
     interval_sec: float = 12.0
     context_words: int = 80
+    # Run the text punctuator even when the ASR engine punctuates natively.
+    # Off by default because it is a second opinion on top of the model's own,
+    # and on Russian nemotron does not need one. It earns its keep on run-on
+    # speech, where nemotron emits almost no sentence marks at all — measured
+    # 0.7-6.7% of English words ending a sentence against 4.7-8.8% on Russian
+    # (docs/NEMOTRON_PUNCTUATION_TODO.md). Costs ~230 MiB of RAM and well under
+    # 1% of one core at the default interval.
+    over_native: bool = False
 
 
 @dataclass(slots=True)
@@ -154,7 +181,10 @@ class TranslateConfig:
     source: str = "auto"
     # "" = the backend's own default checkpoint.
     model: str = ""
-    device: str = "cuda"            # cuda | cpu
+    # auto = GPU when the model actually fits next to the ASR engine, CPU
+    # otherwise (utils/vram.py). "cuda" is still checked for room: an OOM here
+    # disables translation entirely, which is worse than running it slower.
+    device: str = "auto"            # auto | cuda | cpu
     dtype: str = "float16"          # float16 | bfloat16 | float32 (cpu forces float32)
     # The trailing words are cut into a line this long after the last one;
     # until then they may still grow and the line would have to change.
@@ -180,6 +210,13 @@ class UiConfig:
     console_verbose_logs: bool = False
     # Which of the two layout modes the window opens in (design system 3).
     compact: bool = False
+    # Where the model's answer and the summary are shown (design system 7.9):
+    # "inline" — the card inside the feed, capped at 160 px; "side_large" /
+    # "side_compact" — two windows beside the overlay (ответ слева, выжимка
+    # справа) of the normal or the compact size. Unknown value falls back to
+    # "inline" rather than crashing a window that has to open regardless
+    # (ui.theme.tokens.panel_mode does that normalisation).
+    panels: str = "inline"
     # Interval the "Выжимка" button and Alt+5 summarise, in minutes. The button
     # caption is generated from this value, never written by hand (6.6);
     # 0 means "не задан" and the button says so.
@@ -471,11 +508,20 @@ def _normalize_translate(tr: "TranslateConfig") -> None:
         source = normalized or "auto"
     tr.source = source or "auto"
 
+    device = tr.device.strip().lower()
+    if device not in TRANSLATE_DEVICES:
+        logger.warning(
+            "config: translate.device=%r is unknown (allowed: %s); using 'auto'",
+            tr.device, ", ".join(TRANSLATE_DEVICES),
+        )
+        device = "auto"
+    tr.device = device
+
     dtype = tr.dtype.strip().lower()
-    if dtype not in NEMOTRON_DTYPES:
+    if dtype not in TRANSLATE_DTYPES:
         logger.warning(
             "config: translate.dtype=%r is unknown (allowed: %s); using 'float16'",
-            tr.dtype, ", ".join(NEMOTRON_DTYPES),
+            tr.dtype, ", ".join(TRANSLATE_DTYPES),
         )
         dtype = "float16"
     tr.dtype = dtype

@@ -335,6 +335,18 @@ class OpenAICompatClient:
         return f"модель вернула пустой ответ (finish_reason={finish_reason!r})"
 
 
+def is_offline(exc: Exception) -> bool:
+    """The provider could not be reached at all, as opposed to refusing us.
+
+    This is the distinction the title-bar indicator draws — "модель офлайн"
+    (start the server / check the network) against "ошибка" (the request failed,
+    try again). It cannot be recovered from the message text: `describe_error`
+    returns a specific sentence for every case it recognises, and the word the
+    overlay used to search for ("недоступен") appears in none of them.
+    """
+    return isinstance(exc, openai.APIConnectionError)
+
+
 def describe_error(provider: Provider, exc: Exception) -> str:
     """An HTTP failure as an instruction, not a stack trace.
 

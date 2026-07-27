@@ -34,6 +34,18 @@ _SCRIPT_DEFAULT = {"cyrillic": "ru", "latin": "en", "han": "zh", "kana": "ja"}
 # Bounded so a long backlog cannot hold the loop (and the stop event) hostage.
 _MAX_PER_TICK = 4
 
+# Upper bound on the segments a single catch-up merge may fold together.
+# `max_pending` decides *when* to merge; this decides how much at once, and the
+# two are not the same when the backlog is large — translation can be off for an
+# hour (it is off by default, and Alt+T toggles it mid-session), and the store
+# keeps every word of it. Without a cap the first tick after switching on folds
+# the entire backlog into one Segment and hands the model a single padded batch
+# of however many sentences that is: seconds of GPU time in one call and a
+# memory spike that grows with the session, on the same device the ASR engine is
+# using. Merging in bounded steps still never drops or reorders anything — the
+# feed just catches up over a few ticks instead of one.
+_MAX_MERGE_SEGMENTS = 16
+
 
 class TranslationWorker:
     def __init__(
@@ -54,6 +66,7 @@ class TranslationWorker:
         skip_same_script: bool = True,
         enabled: bool = True,
         on_status: Optional[Callable[[str, str], None]] = None,
+        on_notice: Optional[Callable[[str], None]] = None,
     ) -> None:
         self._store = store
         self._translations = translations
@@ -69,10 +82,18 @@ class TranslationWorker:
         self._poll_sec = float(poll_sec)
         self._skip_same_script = bool(skip_same_script)
         self._on_status = on_status
+        self._on_notice = on_notice
+        # Why the model is not on the GPU, when it is not. Empty otherwise.
+        self.device_notice = ""
         self._enabled = threading.Event()
         if enabled:
             self._enabled.set()
         self._failure = ""
+        # First store index this worker may translate. Raised to the end of the
+        # transcript every time translation is switched *on* — see set_enabled.
+        # Starts at 0 so a session that begins with translation enabled still
+        # covers its first word.
+        self._floor = 0
 
     # -- control (Qt thread) ---------------------------------------------
 
@@ -90,7 +111,20 @@ class TranslationWorker:
         return self._failure
 
     def set_enabled(self, on: bool) -> None:
+        """Alt+T, the session menu, or the settings switch. Qt thread.
+
+        Switching *on* starts subtitling from what is said next, not from where
+        the worker last stopped. The toggle reads as "translate what I am
+        listening to"; resuming at the old index instead means the feed fills
+        with however long translation was off — and since the catch-up rule
+        merges consecutive waiting segments, that backlog also arrives as a few
+        enormous lines rather than as subtitles. Speech said while the feature
+        was off stays in the transcript, the store and the export; it just does
+        not get retro-translated.
+        """
         if on:
+            if not self._enabled.is_set():
+                self._floor = self._store.size()
             self._enabled.set()
         else:
             self._enabled.clear()
@@ -106,6 +140,12 @@ class TranslationWorker:
             self._enabled.clear()
             self._status("Перевод", f"Модель перевода не загрузилась: {exc}")
             return
+        # The model loaded, but not necessarily where it was asked to. A
+        # downgrade to CPU changes how the feature behaves (it stays correct and
+        # gets slower), so it is said out loud once rather than left in the log.
+        self.device_notice = getattr(self._backend, "device_notice", "")
+        if self.device_notice and self._on_notice is not None:
+            self._on_notice(self.device_notice)
         logger.info(
             "TranslationWorker started (backend=%s, target=%s, source=%s)",
             self._backend.name, self._target, self._source or "auto",
@@ -131,7 +171,7 @@ class TranslationWorker:
 
     def _step(self) -> bool:
         """Turn the next ready segment into a line. False when there is none."""
-        index = self._translations.next_index()
+        index = max(self._translations.next_index(), self._floor)
         entries = self._store.entries_since(index)
         if not entries:
             return False
@@ -149,7 +189,7 @@ class TranslationWorker:
             return False
         if len(ready) > self._max_pending:
             # Behind the speech: one longer line instead of a growing queue.
-            extra = len(ready) - self._max_pending + 1
+            extra = min(len(ready) - self._max_pending + 1, _MAX_MERGE_SEGMENTS)
             segment = merge(ready[:extra])
             logger.info("translate: merged %d segments to catch up", extra)
         else:

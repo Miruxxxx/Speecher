@@ -88,3 +88,37 @@ def test_a_failed_translation_model_cannot_clobber_the_startup_setting(window):
     window.applied.connect(seen.append)
     window._save()
     assert load_config(window._config).translate.enabled is True
+
+
+def test_a_second_save_does_not_invent_a_restart(window):
+    """`needs_restart` is computed against `_cfg`, so `_cfg` has to follow the
+    file it just wrote.
+
+    The window is a singleton reused for the whole session. When a save left
+    `audio.device_hint` / `asr.engine` / `translate.target` at their old values,
+    every later save compared the unchanged controls against stale config and
+    kept announcing "часть настроек применится после перезапуска".
+    """
+    seen = []
+    window.applied.connect(seen.append)
+
+    window._translate_to.setCurrentIndex(window._translate_to.findData("de"))
+    window._save()
+    assert seen[-1]["needs_restart"] is True        # the target really changed
+    assert window._cfg.translate.target == "de"     # …and _cfg followed it
+
+    window._save()                                  # nothing touched since
+    assert seen[-1]["needs_restart"] is False
+
+
+def test_the_language_field_follows_the_engine_after_a_save(window):
+    """The ASR language is stored per engine. `_current_language()` reads
+    `_cfg.asr.engine`, so a stale engine made it read the wrong field on the
+    next open — and compare the nemotron dropdown against whisper's language."""
+    window._engine.set_index(1)                     # Whisper -> Nemotron
+    window._language.setCurrentIndex(window._language.findData("ru"))
+    window._save()
+
+    assert window._cfg.asr.engine == "nemotron"
+    assert window._cfg.asr.nemotron.language == "ru"
+    assert window._current_language() == "ru"

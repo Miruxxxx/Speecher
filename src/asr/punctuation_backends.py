@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+from contextlib import contextmanager
 from typing import Optional, Protocol
 
 logger = logging.getLogger(__name__)
@@ -33,21 +34,34 @@ class SileroBackend:
     _MODEL_URL = "https://models.silero.ai/te_models/v2_4lang_q.pt"
     _LANGUAGES = ("en", "de", "ru", "es")
 
-    def __init__(self, language: str = "ru") -> None:
+    # Script -> the silero language to punctuate it with. Latin covers en/de/es
+    # and the script cannot tell them apart, so "auto" picks English and a user
+    # who speaks German pins it by hand. Guessing wrong within Latin costs some
+    # commas; guessing across scripts (Russian model on English) corrupts words,
+    # which is what a fixed `language` used to do whenever the speech changed.
+    _SCRIPT_LANGUAGE = {"cyrillic": "ru", "latin": "en"}
+
+    def __init__(self, language: str = "auto") -> None:
         self._language = language
         self._model = None
+        # Captured by load(); stays None when a test injects a fake model, which
+        # is what keeps `restore` runnable on an image with no torch at all.
+        self._torch = None
 
     def load(self) -> None:
+        # Validated before torch is touched: a bad language is a config typo and
+        # should not cost a multi-second import to report — and it keeps this
+        # path testable on the CI image, which deliberately has no torch.
+        if self._language != "auto" and self._language not in self._LANGUAGES:
+            raise ValueError(
+                f"silero-te does not support language {self._language!r} "
+                f"(supported: {list(self._LANGUAGES)}, or 'auto')"
+            )
+
         from pathlib import Path
 
         import torch
         from torch import package as torch_package
-
-        if self._language not in self._LANGUAGES:
-            raise ValueError(
-                f"silero-te does not support language {self._language!r} "
-                f"(supported: {list(self._LANGUAGES)})"
-            )
 
         file_name = self._MODEL_URL.rsplit("/", 1)[-1]
         hub_dir = Path(torch.hub.get_dir())
@@ -64,6 +78,17 @@ class SileroBackend:
 
         importer = torch_package.PackageImporter(str(model_path))
         self._model = importer.load_pickle("te_model", "model")
+        self._torch = torch
+
+    def language_for(self, text: str) -> str:
+        """Which of silero's four languages to punctuate this window with."""
+        if self._language != "auto":
+            return self._language
+        # Imported here, not at module scope: this file must stay importable
+        # without the translate package for the punctuation-only tests.
+        from translate.languages import detect_script
+
+        return self._SCRIPT_LANGUAGE.get(detect_script(text), "en")
 
     def restore(self, text: str) -> str:
         # silero-te expects lowercase input and restores capitalization itself.
@@ -71,7 +96,33 @@ class SileroBackend:
         # windows, so silero sees its own prior output) corrupts the leading
         # letter ("Мы" -> "&Ы") or raises IndexError on short inputs. Lowercasing
         # first is the model's intended usage and makes repeated passes stable.
-        return self._model.enhance_text(text.lower(), self._language)
+        with self._one_thread():
+            return self._model.enhance_text(text.lower(), self.language_for(text))
+
+    @contextmanager
+    def _one_thread(self):
+        """Run the model on a single core, then give the setting back.
+
+        Measured on an 80-word window: at torch's default (one thread per core,
+        20 here) a call costs ~800 ms of CPU for ~47 ms of wall time — the pool
+        burns sixteen times the work for no speedup, because the model is far
+        too small to fill it. Pinned to one thread the same call costs ~72 ms of
+        CPU and finishes in ~50 ms. Nothing waits on this: it is a background
+        rewrite every `interval_sec`, so wall time is not the currency.
+
+        `set_num_threads` is process-global, hence the restore — the translation
+        backend picks its own count and must not inherit ours.
+        """
+        torch = self._torch
+        if torch is None:      # a fake model in a test; there is nothing to pin
+            yield
+            return
+        previous = torch.get_num_threads()
+        try:
+            torch.set_num_threads(1)
+            yield
+        finally:
+            torch.set_num_threads(previous)
 
 
 # The "deepmultilingual" backend (fullstop-punctuation-multilang-large via
@@ -81,7 +132,7 @@ class SileroBackend:
 # naming it fall through to the unknown-backend path (punctuation off).
 
 
-def create_backend(backend: str, language: str) -> Optional[PunctuationBackend]:
+def create_backend(backend: str, language: str = "auto") -> Optional[PunctuationBackend]:
     """Build the configured backend; None means punctuation is off."""
     kind = (backend or "off").strip().lower()
     if kind == "off":

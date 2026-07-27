@@ -23,12 +23,22 @@ from typing import List, Optional, Protocol
 
 import heavy_imports
 from translate import languages
+from utils import vram
 
 logger = logging.getLogger(__name__)
 
 KNOWN_BACKENDS = ("nllb", "opusmt", "off")
 
 NLLB_DEFAULT_MODEL = "facebook/nllb-200-distilled-600M"
+
+# Measured, not guessed: NLLB-200-distilled-600M is 615M parameters, and its
+# weights occupy 1177 MiB on the GPU in fp16 (2354 in fp32). The peak during a
+# batched generate() runs a couple of hundred MiB above that, which is what
+# vram.SAFETY_MARGIN covers.
+NLLB_MIB = {"float16": 1177.0, "bfloat16": 1177.0, "float32": 2354.0}
+
+# Marian is an order of magnitude smaller — one direction, ~300 MB on disk.
+OPUSMT_MIB = {"float16": 150.0, "bfloat16": 150.0, "float32": 300.0}
 
 # Sentence end followed by a space. Kept deliberately dumb — the input is speech
 # with model-restored punctuation, not prose with abbreviations.
@@ -43,6 +53,22 @@ class TranslationBackend(Protocol):
     def load(self) -> None: ...
 
     def translate(self, text: str, source: str, target: str) -> str: ...
+
+
+# Threads a CPU translation may use. Torch defaults to one per core (20 on this
+# machine) and a seq2seq generate() will genuinely take all of them — which
+# starves the Qt thread and the audio pump for the length of every segment. This
+# is a background subtitle track, not the app's main job: four cores is enough to
+# stay well inside the pause the segmenter already waits out.
+_CPU_THREADS = 4
+
+
+def _limit_cpu_threads(torch) -> None:
+    try:
+        if torch.get_num_threads() > _CPU_THREADS:
+            torch.set_num_threads(_CPU_THREADS)
+    except Exception:  # noqa: BLE001 - a torch that refuses is not a reason to fail
+        logger.debug("translate: could not limit CPU threads", exc_info=True)
 
 
 def split_sentences(text: str, max_chars: int) -> List[str]:
@@ -93,6 +119,8 @@ class NllbBackend:
         self._tokenizer = None
         self._model = None
         self._torch = None
+        # Why we are not on the GPU, when we are not. The worker shows it once.
+        self.device_notice = ""
 
     def load(self) -> None:
         # Guarded: the asr-loader thread reaches into the same lazy transformers
@@ -101,10 +129,18 @@ class NllbBackend:
             import torch
             from transformers import AutoModelForSeq2SeqLM, AutoTokenizer
 
-        device = self._device
-        if device == "cuda" and not torch.cuda.is_available():
-            logger.warning("translate: CUDA unavailable, loading %s on CPU", self._model_id)
-            device = "cpu"
+        # Asked before loading, not discovered by an OOM afterwards: the ASR
+        # engine already holds its weights on this card, and a translation model
+        # that does not fit used to disable the whole feature with nothing but a
+        # log line to say why.
+        device, notice = vram.choose_device(
+            self._device,
+            NLLB_MIB.get(self._dtype, NLLB_MIB["float16"]),
+            what="Перевод",
+        )
+        self.device_notice = notice
+        if notice:
+            logger.warning("translate: %s", notice)
         # fp16 on CPU is not a memory saving, it is a slowdown: there are no
         # half-precision kernels for most CPU ops and torch converts back and
         # forth around every one of them.
@@ -115,6 +151,7 @@ class NllbBackend:
         }.get(self._dtype, torch.float16)
         if device == "cpu":
             dtype = torch.float32
+            _limit_cpu_threads(torch)
 
         self._tokenizer = AutoTokenizer.from_pretrained(self._model_id)
         model = AutoModelForSeq2SeqLM.from_pretrained(self._model_id, dtype=dtype)
@@ -178,10 +215,9 @@ class OpusMtBackend:
         self._tokenizer = None
         self._model = None
         self._torch = None
+        self.device_notice = ""
 
     def load(self) -> None:
-        import torch
-
         try:
             import sentencepiece  # noqa: F401
         except ImportError as exc:
@@ -189,7 +225,11 @@ class OpusMtBackend:
                 "бэкенду opusmt нужны sentencepiece и sacremoses: "
                 ".venv\\Scripts\\python -m pip install sentencepiece sacremoses"
             ) from exc
+        # torch inside the guard, like NllbBackend: the rule is "the whole
+        # import statement block", and an exception here is exactly how the
+        # next call site starts drifting out of it.
         with heavy_imports.transformers():
+            import torch
             from transformers import AutoModelForSeq2SeqLM, AutoTokenizer
 
         src = languages.get(self._source)
@@ -199,9 +239,14 @@ class OpusMtBackend:
                 f"opusmt needs a fixed pair; got {self._source!r} -> {self._target!r}"
             )
         model_id = self._model or f"Helsinki-NLP/opus-mt-{src.code}-{tgt.code}"
-        device = self._device
-        if device == "cuda" and not torch.cuda.is_available():
-            device = "cpu"
+        device, notice = vram.choose_device(
+            self._device, OPUSMT_MIB["float32"], what="Перевод"
+        )
+        self.device_notice = notice
+        if notice:
+            logger.warning("translate: %s", notice)
+        if device == "cpu":
+            _limit_cpu_threads(torch)
 
         self._tokenizer = AutoTokenizer.from_pretrained(model_id)
         self._model = AutoModelForSeq2SeqLM.from_pretrained(model_id).to(device).eval()
