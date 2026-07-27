@@ -11,7 +11,7 @@ from PyQt6.QtCore import QTimer
 from PyQt6.QtWidgets import QApplication
 
 from app_config import AppConfig, load_config
-from asr.backends import create_asr_backend
+from asr.backends import EngineProfile, create_asr_backend
 from asr.events import ASREvent
 from asr.punctuation_backends import create_backend
 from asr.punctuation_worker import PunctuationWorker
@@ -90,6 +90,7 @@ def _load_asr_pipeline(
     overlay: Overlay,
     pipeline: _Pipeline,
     frame_sink: "queue.Queue | None" = None,
+    capture=None,
 ) -> None:
     """Loads the ASR backend and starts its loop. Runs in a background thread
     so the overlay window is interactive from the first second."""
@@ -110,6 +111,11 @@ def _load_asr_pipeline(
             # not a reason to leave the user without transcription.
             logger.exception("%s backend failed to load; falling back to whisper", backend.name)
             overlay.post_status(f"{backend.name} не загрузился ({exc}); включаю Whisper…")
+            # Nobody drains the frame queue once whisper is the engine, so stop
+            # filling it — otherwise the supervisor counts a dropped chunk eight
+            # times a second and says so in the log for the whole session.
+            if capture is not None:
+                capture.set_frame_sink(None)
             backend = create_asr_backend(
                 cfg,
                 audio_buffer=audio_buffer,
@@ -128,12 +134,14 @@ def _load_asr_pipeline(
         )
         pipeline.engine_thread.start()
         overlay.post_status("")
-        model = cfg.asr.nemotron.model if backend.name == "nemotron" else cfg.asr.model
-        # The session header was written with the *configured* engine before the
-        # model had tried to load. Correct it now that the truth is known — the
-        # export and the journal must not name an engine that produced nothing.
-        overlay.set_engine(backend.name, model, requested=cfg.asr.engine)
-        logger.info("ASR engine started (backend=%s, model=%s)", backend.name, model)
+        # The profile of what actually loaded, which after a fallback is not the
+        # configured one. The session header was written with the *configured*
+        # engine before the model had tried to load; correct it now that the
+        # truth is known — the export and the journal must not name an engine
+        # that produced nothing.
+        actual = EngineProfile.for_name(cfg, backend.name)
+        overlay.set_engine(actual.name, actual.model, requested=cfg.asr.engine)
+        logger.info("ASR engine started (backend=%s, model=%s)", actual.name, actual.model)
     except Exception as exc:
         logger.exception("ASR pipeline failed to load")
         overlay.post_status(f"Ошибка загрузки ASR: {exc}")
@@ -161,6 +169,10 @@ def main() -> None:
         sample_rate=cfg.audio.target_sample_rate, max_seconds=cfg.asr.buffer_max_seconds
     )
 
+    # Everything that follows from `asr.engine`, decided once. Five separate
+    # `== "nemotron"` checks used to live in this function.
+    engine = EngineProfile.resolve(cfg)
+
     # Persistence hangs off the store, so words committed by the splitter and
     # punctuation rewritten by nemotron/PunctuationWorker all reach the journal.
     session_dir = Path(cfg.storage.dir)
@@ -170,11 +182,9 @@ def main() -> None:
         # Computed here, not inside the writer, so the journal's meta line and
         # the export header carry the same start time.
         "started": datetime.now().isoformat(timespec="seconds"),
-        "engine": cfg.asr.engine,
-        "model": cfg.asr.nemotron.model if cfg.asr.engine == "nemotron" else cfg.asr.model,
-        "language": (
-            cfg.asr.nemotron.language if cfg.asr.engine == "nemotron" else cfg.asr.language
-        ),
+        "engine": engine.name,
+        "model": engine.model,
+        "language": engine.language,
         "sample_rate": cfg.audio.target_sample_rate,
     }
     if cfg.translate.backend != "off":
@@ -194,7 +204,7 @@ def main() -> None:
     # Push-style backends read frames as they arrive; the pull-style whisper
     # path takes snapshots of audio_buffer and wants no queue at all.
     frame_sink: "queue.Queue | None" = (
-        queue.Queue(maxsize=256) if cfg.asr.engine == "nemotron" else None
+        queue.Queue(maxsize=256) if engine.push_style else None
     )
 
     capture = RustCaptureSupervisor(
@@ -285,7 +295,10 @@ def main() -> None:
     pipeline = _Pipeline()
     loader_thread = threading.Thread(
         target=_load_asr_pipeline,
-        args=(cfg, audio_buffer, raw_events, stop_event, latency, overlay, pipeline, frame_sink),
+        args=(
+            cfg, audio_buffer, raw_events, stop_event, latency, overlay, pipeline,
+            frame_sink, capture,
+        ),
         name="asr-loader",
         daemon=True,
     )
@@ -304,9 +317,7 @@ def main() -> None:
             stop_event=stop_event,
             target=cfg.translate.target,
             source=cfg.translate.source,
-            asr_language=(
-                cfg.asr.nemotron.language if cfg.asr.engine == "nemotron" else cfg.asr.language
-            ),
+            asr_language=engine.language,
             close_after_sec=cfg.translate.close_after_sec,
             pause_sec=cfg.translate.pause_sec,
             max_words_per_segment=cfg.translate.max_words_per_segment,
@@ -315,6 +326,9 @@ def main() -> None:
             skip_same_script=cfg.translate.skip_same_script,
             enabled=cfg.translate.enabled,
             on_status=overlay.post_status,
+            # A CPU fallback is a lasting change to how the feature performs,
+            # not a passing status line — it gets a panel the user dismisses.
+            on_notice=overlay.post_advice,
         )
         overlay.set_translator(translator)
         translate_thread = threading.Thread(
@@ -326,12 +340,22 @@ def main() -> None:
 
     punct_thread: threading.Thread | None = None
     punct_backend = None
-    if cfg.asr.engine == "nemotron":
-        # Nemotron punctuates and cases its own output; re-punctuating it would
-        # only fight the model. Logged so it doesn't read as a broken feature.
-        logger.info("punctuation worker disabled: engine=nemotron punctuates natively")
+    if engine.punctuates_itself and not cfg.punctuation.over_native:
+        # Nemotron punctuates and cases its own output, and on Russian it needs
+        # no second opinion. Logged so it doesn't read as a broken feature —
+        # `[punctuation] over_native = true` turns it on for the case where the
+        # model emits almost nothing (run-on speech; see the config comment).
+        logger.info(
+            "punctuation worker disabled: engine=%s punctuates natively "
+            "([punctuation] over_native = false)", engine.name
+        )
     else:
         punct_backend = create_backend(cfg.punctuation.backend, cfg.punctuation.language)
+        if punct_backend is not None and engine.punctuates_itself:
+            logger.info(
+                "punctuation worker runs on top of %s ([punctuation] over_native = true)",
+                engine.name,
+            )
     if punct_backend is not None:
         worker = PunctuationWorker(
             store=store,

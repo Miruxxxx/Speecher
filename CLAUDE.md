@@ -6,7 +6,7 @@ Speecher — Windows-only real-time transcription of **system audio** (WASAPI lo
 
 ```powershell
 .venv\Scripts\python -m src            # run the app (overlay window; models load in background)
-.venv\Scripts\python -m pytest tests/  # unit tests, no GPU/audio needed (309 tests)
+.venv\Scripts\python -m pytest tests/  # unit tests, no GPU/audio needed (362 tests)
 .venv\Scripts\python scripts\list_audio_devices.py  # enumerate audio endpoints
 .venv\Scripts\python scripts\capture_soak.py --backend rust --seconds 900  # capture soak test
 .venv\Scripts\python scripts\translate_probe.py  # load the MT model, time a few phrases
@@ -174,7 +174,7 @@ fonts and emoji are not used anywhere.
 ```
 src/ui/theme/     tokens.py (colours/type/space/motion, Qt-free), fonts, icons (inline SVG), styles (QSS)
 src/ui/widgets/   indicators, buttons, transcript feed, cards, titlebar, settings fields
-src/ui/windows/   settings, history, notification + fatal, onboarding + cheat sheet, source (live original)
+src/ui/windows/   settings, history, notification + fatal, onboarding + cheat sheet, source (live original), side (answer/summary beside the overlay, §7.9)
 src/ui/overlay.py the window itself; transcript_model.py groups words into replies; markup.py renders a model's markdown; hotkeys.py registers Alt+…
 ```
 

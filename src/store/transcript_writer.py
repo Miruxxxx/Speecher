@@ -196,16 +196,46 @@ class TranscriptWriter:
     def record(self, rec: dict) -> None:
         """Journal one store mutation. Never raises — a broken disk must not
         take down the transcript pipeline that feeds the UI."""
+        self.record_many([rec])
+
+    def record_many(self, records: list[dict]) -> None:
+        """Journal a whole mutation: one lock, one flush, whatever its size.
+
+        The store hands its records over in one call precisely so this can be
+        one flush. It matters for `load_entries`, which replays an entire
+        previous session as a single mutation — flushing per word turned
+        resuming into thousands of syscalls on the Qt thread. Live commits are a
+        few words at a time and are unaffected either way; the durability
+        contract is unchanged, because a mutation is still on disk before this
+        returns."""
+        if not records:
+            return
         with self._lock:
             if self._fh is None:
                 return
-            if rec.get("t") == "w":
-                self._words_written += 1
-            self._write_locked(rec)
+            for rec in records:
+                if rec.get("t") == "w":
+                    self._words_written += 1
+                if not self._write_locked(rec, flush=False):
+                    return          # the journal died mid-batch and is now off
+            self._flush_locked()
 
-    def _write_locked(self, rec: dict) -> None:
+    def _write_locked(self, rec: dict, *, flush: bool = True) -> bool:
+        """Write one record. False means the journal just died and is off."""
         try:
             self._fh.write(json.dumps(rec, ensure_ascii=False) + "\n")
+            if flush:
+                self._fh.flush()
+        except _IO_ERRORS as exc:
+            self._close_locked()
+            self._fail(f"запись прервана: {exc}")
+            return False
+        return True
+
+    def _flush_locked(self) -> None:
+        if self._fh is None:
+            return
+        try:
             self._fh.flush()
         except _IO_ERRORS as exc:
             self._close_locked()

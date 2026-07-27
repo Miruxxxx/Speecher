@@ -133,7 +133,11 @@ class StreamingASREngine:
             return
 
         # Silence gate: don't burn a GPU decode on an all-quiet buffer.
-        rms = float(np.sqrt(np.mean(np.square(audio))))
+        # `np.dot` and not `np.mean(np.square(...))`: the latter materialises a
+        # second copy of the whole snapshot (up to max_buffer_sec of audio) once
+        # a second just to decide whether to skip. Same value, no allocation —
+        # this is the form capture_base already uses in the audio path.
+        rms = float(np.sqrt(np.dot(audio, audio) / len(audio)))
         if rms < self._silence_rms_threshold:
             self._register_empty_decode()
             return

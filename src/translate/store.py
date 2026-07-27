@@ -63,9 +63,6 @@ class TranslationStore:
     def target(self) -> str:
         return self._target
 
-    def set_journal(self, journal: Optional[Journal]) -> None:
-        self._journal = journal
-
     # -- writing ---------------------------------------------------------
 
     def add(self, segment: Segment, text: str, state: str) -> Row:

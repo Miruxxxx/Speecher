@@ -163,6 +163,78 @@ class Notification(QWidget):
         p.end()
 
 
+class AdviceWindow(QWidget):
+    """A non-fatal "you should know this" panel, same shape as FatalWindow.
+
+    For the state that is neither an error nor a passing status: the program is
+    working, but not the way the settings asked for it, and the user would
+    reasonably want to know. Live translation falling back to the CPU because the
+    GPU had no room is the case it was built for — the feature is correct and
+    slower, which a status line that clears itself in seconds cannot convey.
+
+    Not modal: nothing is waiting on the answer, and the transcript behind it
+    must keep running.
+    """
+
+    def __init__(
+        self, title: str, message: str, parent: Optional[QWidget] = None
+    ) -> None:
+        super().__init__(parent)
+        self.setWindowFlags(
+            Qt.WindowType.Dialog
+            | Qt.WindowType.FramelessWindowHint
+            | Qt.WindowType.WindowStaysOnTopHint
+        )
+        self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground)
+        self.setFixedSize(FATAL_W, FATAL_H)
+
+        root = QVBoxLayout(self)
+        root.setContentsMargins(Space.S4, Space.S4, Space.S4, Space.S4)
+        root.setSpacing(Space.S2)
+
+        icon = QLabel()
+        icon.setFixedSize(32, 32)
+        icon.setPixmap(icons.pixmap("warning", 32, Color.TEXT_SECONDARY))
+        root.addWidget(icon, 0, Qt.AlignmentFlag.AlignHCenter)
+
+        heading = QLabel(title)
+        heading.setFont(qfont(Type.WINDOW_TITLE))
+        heading.setStyleSheet(label_qss(Type.WINDOW_TITLE))
+        root.addWidget(heading, 0, Qt.AlignmentFlag.AlignHCenter)
+
+        body = QLabel(message)
+        body.setWordWrap(True)
+        body.setAlignment(Qt.AlignmentFlag.AlignHCenter)
+        body.setFont(qfont(Type.MENU_ITEM))
+        body.setStyleSheet(
+            f"QLabel {{ background: transparent; color: {Color.TEXT_SECONDARY}; }}"
+        )
+        root.addWidget(body, 1)
+
+        button = TextButton("Понятно", self, height=32, style=Type.BUTTON_LABEL)
+        button.clicked.connect(self.close)
+        root.addWidget(button, 0, Qt.AlignmentFlag.AlignHCenter)
+
+    def paintEvent(self, _event) -> None:
+        p = QPainter(self)
+        p.setRenderHint(QPainter.RenderHint.Antialiasing)
+        pen = QPen(qcolor(Color.BORDER_STRONG))
+        pen.setWidthF(Border.WIDTH)
+        p.setPen(pen)
+        p.setBrush(qcolor(Color.BG_WINDOW))
+        p.drawRoundedRect(
+            QRectF(self.rect()).adjusted(0.5, 0.5, -0.5, -0.5),
+            Radius.WINDOW, Radius.WINDOW,
+        )
+        p.end()
+
+    def keyPressEvent(self, event) -> None:
+        if event.key() in (Qt.Key.Key_Escape, Qt.Key.Key_Return, Qt.Key.Key_Enter):
+            self.close()
+            return
+        super().keyPressEvent(event)
+
+
 class FatalWindow(QWidget):
     """320x200 modal, one button, and the app is over (section 2.6)."""
 

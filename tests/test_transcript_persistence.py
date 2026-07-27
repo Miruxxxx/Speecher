@@ -339,3 +339,48 @@ def test_suggest_export_name_follows_the_session_file(tmp_path):
     assert session_io.suggest_export_name({}, source, "md") == "2026-07-24_193000.md"
     name = session_io.suggest_export_name({"started": "2026-07-24T19:30:00"}, None, "txt")
     assert name.endswith(".txt") and "2026" in name
+
+
+def test_resuming_a_session_costs_one_flush_not_one_per_word(tmp_path):
+    """`load_entries` replays a whole previous session as a single mutation.
+
+    It runs on the Qt thread (the session menu calls it), so a flush per word
+    froze the window for thousands of syscalls on a long session. The store now
+    hands the journal the whole mutation and the writer flushes once — with the
+    same durability contract: everything is on disk before the call returns.
+    """
+    writer = TranscriptWriter(tmp_path)
+    writer.start()
+    store = TranscriptStore(journal=writer)
+
+    flushes = []
+    real_flush = writer._fh.flush
+    writer._fh.flush = lambda: (flushes.append(1), real_flush())[1]
+
+    entries = [(Word(text=f"w{i}", start=i * 0.1, end=i * 0.1 + 0.05), 1_700_000_000.0)
+               for i in range(500)]
+    assert store.load_entries(entries) == 500
+    assert len(flushes) == 1
+
+    # …and the file really holds all of it, in order.
+    writer.close()
+    _meta, replayed = session_io.read_session(writer.path)
+    assert [e.word.text for e in replayed] == [f"w{i}" for i in range(500)]
+
+
+def test_a_batch_that_dies_midway_still_disables_the_journal(tmp_path):
+    """A write failure inside a batch must switch the journal off exactly like a
+    single-record failure does, not raise into the caller."""
+    writer = TranscriptWriter(tmp_path)
+    writer.start()
+    store = TranscriptStore(journal=writer)
+
+    seen: list[str] = []
+    writer.set_error_handler(seen.append)
+    writer._fh.close()          # the disk went away mid-session
+
+    store.append([Word(text="a", start=0.0, end=0.1),
+                  Word(text="b", start=0.2, end=0.3)])
+
+    assert writer.failed and len(seen) == 1
+    assert not writer.enabled

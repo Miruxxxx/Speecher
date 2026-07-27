@@ -300,9 +300,14 @@ class NemotronBackend:
                     return
                 # Grab 5 of the model-card example: its loop drops the last
                 # partial chunk and cuts the tail of the phrase.
-                pending = np.concatenate(
-                    (pending, np.zeros(need - len(pending), dtype=np.float32))
-                )
+                # Only pad a *short* tail: the wait loop above also exits when a
+                # full chunk is already buffered, and stop_event can be set in
+                # that same instant — `np.zeros` of a negative length would then
+                # raise and turn a clean shutdown into a fatal engine error.
+                if len(pending) < need:
+                    pending = np.concatenate(
+                        (pending, np.zeros(need - len(pending), dtype=np.float32))
+                    )
 
             block, pending = pending[:need], pending[need:]
             features = processor(

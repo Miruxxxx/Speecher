@@ -32,7 +32,17 @@ from audio.rust_capture import list_devices, resolve_binary
 from translate import languages
 from ui.theme.fonts import qfont
 from ui.theme.styles import field_qss, label_qss
-from ui.theme.tokens import Color, SETTINGS_H, SETTINGS_W, Space, Type
+from ui.theme.tokens import (
+    Color,
+    PANELS_INLINE,
+    PANELS_SIDE_COMPACT,
+    PANELS_SIDE_LARGE,
+    SETTINGS_H,
+    SETTINGS_W,
+    Space,
+    Type,
+    panel_mode,
+)
 from ui.widgets.buttons import TextButton
 from ui.widgets.fields import CONTROL_H, FieldRow, HotkeyEdit, Section, SegmentedControl
 from ui.widgets.llm_section import LlmSection
@@ -48,6 +58,14 @@ INTERVAL_CHOICES: List[tuple[int, str]] = [
     (10, "10 минут"),
     (15, "15 минут"),
     (30, "30 минут"),
+]
+
+# Where the answer and the summary are shown (§7.9). Captions say what the user
+# will see, not what the config key is called.
+PANEL_CHOICES = [
+    (PANELS_INLINE, "карточкой в ленте"),
+    (PANELS_SIDE_LARGE, "окнами по бокам"),
+    (PANELS_SIDE_COMPACT, "окнами по бокам, компактными"),
 ]
 
 LANGUAGE_CHOICES = [
@@ -156,6 +174,21 @@ class SettingsWindow(Panel):
                 ],
             )
         )
+
+        # -- where the answer and the summary appear --------------------
+        # Applies live: the overlay only has to stop using the card and start
+        # using the two windows, and nothing in the pipeline knows about either.
+        self._panels = QComboBox()
+        self._panels.setFixedHeight(CONTROL_H)
+        for value, caption in PANEL_CHOICES:
+            self._panels.addItem(caption, value)
+        self._select(self._panels, panel_mode(cfg.ui.panels))
+        panels_row = FieldRow("Ответ и выжимка", self._panels)
+        panels_row.setToolTip(
+            "Карточка в ленте не выше 160 px; окна по бокам — ответ слева, "
+            "выжимка справа, размером с главное окно"
+        )
+        body.addWidget(Section("Окна", [panels_row]))
 
         # -- translation ------------------------------------------------
         # The switch applies live (it is the same one Alt+T flips); the target
@@ -268,6 +301,7 @@ class SettingsWindow(Panel):
         language = self._language.currentData()
         interval = int(self._interval.currentData())
         auto = self._auto.index() == 1
+        panels = str(self._panels.currentData())
         device = self._device.currentData() or ""
 
         translate_on = self._translate.index() == 1
@@ -288,7 +322,11 @@ class SettingsWindow(Panel):
             "asr": {"engine": engine},
             "llm": {"provider": llm["provider"], "model": llm["model"]},
             "llm.models": dict(llm["models"]),
-            "ui": {"summary_interval_min": interval, "auto_summary": auto},
+            "ui": {
+                "summary_interval_min": interval,
+                "auto_summary": auto,
+                "panels": panels,
+            },
             "translate": {"enabled": translate_on, "target": translate_to},
             "hotkeys": {a: e.combo() for a, e in self._hotkeys.items()},
         }
@@ -306,22 +344,40 @@ class SettingsWindow(Panel):
         # Apply what can be applied without a restart, and say so.
         self._cfg.ui.summary_interval_min = interval
         self._cfg.ui.auto_summary = auto
+        self._cfg.ui.panels = panels
         self._cfg.llm.provider = str(llm["provider"])
         self._cfg.llm.model = str(llm["model"])
         self._cfg.llm.models = dict(llm["models"])
         for action, edit in self._hotkeys.items():
             setattr(self._cfg.hotkeys, action, edit.combo())
+        # Computed while _cfg still holds the previous values — everything below
+        # this line overwrites them.
         restart = (
             device != self._cfg.audio.device_hint
             or engine != self._cfg.asr.engine
             or language != self._current_language()
             or translate_to != self._cfg.translate.target
         )
+        # These four reach the pipeline only on restart, but _cfg must still
+        # mirror what was just written to config.toml. The window is a singleton
+        # that recomputes `restart` against them on the next save, so leaving
+        # them stale makes every later save claim a restart is needed — and
+        # _current_language() reads _cfg.asr.engine, so after switching engines
+        # it would compare the new dropdown against the old engine's field.
+        # Language first: it is stored per engine, keyed off the new value.
+        if engine == "nemotron":
+            self._cfg.asr.nemotron.language = language
+        else:
+            self._cfg.asr.language = language
+        self._cfg.audio.device_hint = device
+        self._cfg.asr.engine = engine
+        self._cfg.translate.target = translate_to
         self._cfg.translate.enabled = translate_on
         self.applied.emit(
             {
                 "summary_interval_min": interval,
                 "auto_summary": auto,
+                "panels": panels,
                 "translate_enabled": translate_on,
                 "hotkeys": {a: e.combo() for a, e in self._hotkeys.items()},
                 # Built here, where the typed key is still in hand: the overlay

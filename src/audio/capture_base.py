@@ -155,6 +155,18 @@ class CaptureSupervisorBase:
         if self._frame_sink is not None:
             self._push_frame(audio)
 
+    def set_frame_sink(self, sink: "Optional[queue.Queue[np.ndarray]]") -> None:
+        """Attach or detach the push-style backend's queue. Any thread.
+
+        Detaching matters after a fallback: the sink is created for the
+        `nemotron` engine, but if that engine fails to load the app runs
+        whisper, which pulls from the buffer and never drains this queue. It
+        fills within seconds and then every chunk is a counted drop, logging a
+        line every few seconds for the rest of the session about a backend that
+        is not running. A plain attribute swap, like the state fields above.
+        """
+        self._frame_sink = sink
+
     def capture_state(self) -> tuple[str, str]:
         """(state, reason) for the UI indicator. Safe to call from any thread."""
         phase = self._child_phase

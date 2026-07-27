@@ -13,6 +13,8 @@ class Journal(Protocol):
 
     def record(self, rec: dict) -> None: ...
 
+    def record_many(self, records: List[dict]) -> None: ...
+
 
 class TranscriptStore:
     """Thread-safe accumulator for committed ASR words with time-indexed queries.
@@ -31,14 +33,18 @@ class TranscriptStore:
         self._entries: List[Tuple[Word, float]] = []  # (word, wall_clock_receive_time)
         self._journal = journal
 
-    def set_journal(self, journal: Optional[Journal]) -> None:
-        self._journal = journal
-
     def _emit(self, records: List[dict]) -> None:
+        """Hand a whole mutation to the journal in one call.
+
+        One call, not one per record: `record` locks and fsync-less-flushes each
+        time, and `load_entries` replays an entire previous session in a single
+        mutation. Per-record writes made resuming a 10k-word session ten
+        thousand lock/write/flush round trips — on the Qt thread, since the
+        resume runs from the session menu.
+        """
         if self._journal is None or not records:
             return
-        for rec in records:
-            self._journal.record(rec)
+        self._journal.record_many(records)
 
     def append(self, words: List[Word]) -> None:
         t = time.time()

@@ -2,8 +2,6 @@ from __future__ import annotations
 
 import logging
 import queue
-import subprocess
-import threading
 from dataclasses import fields
 from pathlib import Path
 from typing import Optional
@@ -20,10 +18,8 @@ from PyQt6.QtCore import (
 )
 from PyQt6.QtGui import QPainter, QPen
 from PyQt6.QtWidgets import (
-    QFileDialog,
     QHBoxLayout,
     QMenu,
-    QMessageBox,
     QVBoxLayout,
     QWidget,
 )
@@ -31,15 +27,16 @@ from PyQt6.QtWidgets import (
 from app_config import AppConfig
 from asr.events import ASREvent
 from audio import capture_base
-from llm.engine import LLMEngine, LLMTask
+from llm.engine import LLMEngine
 from llm.summaries import SummaryHistory
-from store import session_io
 from store.transcript_store import TranscriptStore
 from store.transcript_writer import TranscriptWriter
 from translate import languages
 from translate.store import TranslationStore
 from ui import transcript_model
 from ui.hotkeys import HotkeyManager, describe
+from ui.llm_presenter import LlmPresenter
+from ui.session import SessionController
 from ui.theme.fonts import load_app_fonts, qcolor
 from ui.theme.styles import menu_qss, tooltip_qss
 from ui.theme.tokens import (
@@ -49,22 +46,18 @@ from ui.theme.tokens import (
     LayoutMode,
     Motion,
     NORMAL,
+    PANELS_INLINE,
     Radius,
     Space,
+    panel_mode,
 )
 from ui.widgets.buttons import ActionButton
 from ui.widgets.cards import AnswerCard, CapturePlate
 from ui.widgets.indicators import (
     ERROR,
     LIVE,
-    LLM_ERROR,
-    LLM_GENERATING,
-    LLM_OFFLINE,
-    LLM_ONLINE,
-    LLM_THINKING,
     REC_FAILED,
     REC_ON,
-    REC_PAUSED,
     SILENT,
     capture_caption,
     capture_tooltip,
@@ -77,9 +70,10 @@ from ui.widgets.indicators import (
 from ui.widgets.titlebar import TitleBar
 from ui.widgets.transcript import TranscriptView
 from ui.windows.history import HistoryWindow
-from ui.windows.notification import FatalWindow, Notification
+from ui.windows.notification import AdviceWindow, FatalWindow, Notification
 from ui.windows.onboarding import CheatSheetWindow, OnboardingWindow
 from ui.windows.settings import SettingsWindow
+from ui.windows.side import SidePanel, answer_panel, summary_panel
 from ui.windows.source import SourceWindow
 
 logger = logging.getLogger(__name__)
@@ -127,12 +121,9 @@ class Overlay(QWidget):
     is a fixed 14x14 whatever it draws.
     """
 
-    _llm_token_sig = pyqtSignal(str)
-    _llm_done_sig = pyqtSignal()
-    _llm_error_sig = pyqtSignal(str)
     _status_sig = pyqtSignal(str, str)
-    _lm_health_sig = pyqtSignal(bool)
     _journal_error_sig = pyqtSignal(str)
+    _advice_sig = pyqtSignal(str, str)   # (title, body) — worker thread -> Qt
 
     def __init__(
         self,
@@ -158,8 +149,32 @@ class Overlay(QWidget):
         self._capture = capture
         self._summaries = summaries or SummaryHistory()
         self._session_dir = Path(session_dir) if session_dir else None
-        self._session_meta: dict = {}
         self._translations = translations or TranslationStore(cfg.translate.target)
+        # The session's data, its journal and its header. Everything the menu
+        # does that is not about pixels lives there — see ui/session.py.
+        self._session = SessionController(
+            store=store,
+            translations=self._translations,
+            writer=writer,
+            session_dir=self._session_dir,
+            meta={},
+            record_hotkey=cfg.hotkeys.toggle_recording,
+            parent=self,
+        )
+        self._session.status.connect(self.post_status)
+        self._session.changed.connect(self._on_session_changed)
+        # The LLM state machine. It owns "is a task running / is the provider
+        # reachable / what has streamed so far" and never touches a widget; the
+        # handlers below turn its transitions into card and indicator updates.
+        self._llm_ui = LlmPresenter(
+            llm=llm,
+            store=store,
+            cfg=cfg,
+            summaries=self._summaries,
+            is_visible=self.isVisible,
+            minutes_caption=minutes_caption,
+            parent=self,
+        )
         # Set by main once the worker exists; None means the feature is off in
         # the config and the toggle says so instead of doing nothing.
         self._translator = None
@@ -170,32 +185,30 @@ class Overlay(QWidget):
         self._source_dismissed = False
         # Reset whenever translation is switched on; see _warn_if_nothing_to_translate.
         self._skip_warned = False
-        # Filled by the loader once the model is up; "" until then. The
-        # requested one is kept only when it differs — i.e. after a fallback.
-        self._engine_actual = ""
-        self._engine_requested = ""
-
         self._max_recent_chars = cfg.ui.max_recent_chars
-        self._max_summary_chars = cfg.llm.max_summary_chars
         self._max_words = max(120, cfg.ui.max_recent_chars // 4)
 
         self._mode: LayoutMode = COMPACT if cfg.ui.compact else NORMAL
         self._partial = ""
-        self._llm_output = ""
-        self._llm_busy = False
-        self._llm_state = LLM_OFFLINE
-        self._llm_kind = ""
-        self._llm_minutes = 0.0
-        self._llm_auto = False
         self._fatal_active = False
         self._capture_state = SILENT
-        self._pending_summary = False   # a summary arrived while hidden
+
+        # Where an answer/summary is shown: the in-feed card, or the two windows
+        # beside the overlay (§7.9). Built on demand — in the default mode they
+        # are never created at all.
+        self._panels = panel_mode(cfg.ui.panels)
+        self._answer_panel: Optional[SidePanel] = None
+        self._summary_panel: Optional[SidePanel] = None
+        # Panels hidden by Alt+Space, so the same key brings back exactly the
+        # ones that were open — and not the ones the user had closed.
+        self._panels_hidden: list = []
 
         self._settings_window: Optional[SettingsWindow] = None
         self._history_window: Optional[HistoryWindow] = None
         self._about_window: Optional[OnboardingWindow] = None
         self._cheatsheet_window: Optional[CheatSheetWindow] = None
         self._fatal_window: Optional[FatalWindow] = None
+        self._advice_window: Optional[AdviceWindow] = None
 
         load_app_fonts()
         self._setup_window()
@@ -225,17 +238,6 @@ class Overlay(QWidget):
         self._capture_timer = QTimer(self)
         self._capture_timer.timeout.connect(self._refresh_capture)
         self._capture_timer.start(_CAPTURE_POLL_MS)
-
-        # Re-probe LM Studio periodically so the indicator tracks the server
-        # going up or down after startup, not just its state 500 ms in.
-        self._health_timer = QTimer(self)
-        self._health_timer.timeout.connect(self._check_lm_availability)
-        self._health_timer.start(20000)
-        QTimer.singleShot(500, self._check_lm_availability)
-
-        self._auto_summary_timer = QTimer(self)
-        self._auto_summary_timer.timeout.connect(self._on_auto_summary)
-        self._apply_auto_summary()
 
         if not cfg.ui.onboarding_shown:
             QTimer.singleShot(700, self._show_onboarding)
@@ -304,16 +306,24 @@ class Overlay(QWidget):
         root.addWidget(content, 1)
 
     def _connect_signals(self) -> None:
-        self._btn_answer.clicked.connect(self._on_answer)
-        self._btn_summary.clicked.connect(lambda: self._on_summary(auto=False))
-        self._btn_question.clicked.connect(self._on_last_question)
+        self._btn_answer.clicked.connect(self._llm_ui.answer)
+        self._btn_summary.clicked.connect(lambda: self._llm_ui.summarize())
+        self._btn_question.clicked.connect(self._llm_ui.last_question)
 
-        self._llm_token_sig.connect(self._on_llm_token)
-        self._llm_done_sig.connect(self._on_llm_done)
-        self._llm_error_sig.connect(self._on_llm_error)
+        self._llm_ui.state_changed.connect(self._on_llm_state)
+        self._llm_ui.answer_started.connect(self._on_llm_started)
+        self._llm_ui.answer_updated.connect(self._on_llm_updated)
+        self._llm_ui.answer_finished.connect(self._on_llm_finished)
+        self._llm_ui.answer_failed.connect(self._on_llm_failed)
+        self._llm_ui.summary_added.connect(self._on_summary_added)
+        self._llm_ui.question_ready.connect(self._on_question_ready)
+        self._llm_ui.answer_dismissed.connect(self._on_llm_dismissed)
+        self._llm_ui.notify.connect(self._on_llm_notify)
+        self._llm_ui.status.connect(self.post_status)
+
         self._status_sig.connect(self._on_status)
-        self._lm_health_sig.connect(self._on_lm_health)
         self._journal_error_sig.connect(self._on_journal_error)
+        self._advice_sig.connect(self._on_advice)
 
     # ------------------------------------------------------------------
     # Layout modes (section 3)
@@ -357,6 +367,9 @@ class Overlay(QWidget):
         super().resizeEvent(event)
         self._answer.reposition()
         self._plate.reposition()
+        # Compact/normal changes the overlay's width, so the window docked to
+        # its right edge is no longer at that edge.
+        self._reposition_panels()
 
     # ------------------------------------------------------------------
     # Background painting
@@ -379,9 +392,15 @@ class Overlay(QWidget):
         from PyQt6.QtWidgets import QApplication
 
         self._hotkeys.stop()
+        # Release the prober before the widget goes: it emits a signal bound to
+        # this object, and a probe in flight would otherwise land on a
+        # half-destroyed window.
+        self._llm_ui.stop()
         self._notification.hide()
         if self._source_window is not None:
             self._source_window.hide()
+        for panel in self._panel_windows():
+            panel.hide()
         QApplication.instance().quit()
         event.accept()
 
@@ -395,7 +414,7 @@ class Overlay(QWidget):
             if self._transcript.textCursor().hasSelection():
                 self._transcript.copy()
             else:
-                self._copy_transcript()
+                self._session.copy_transcript()
             return
         super().keyPressEvent(ev)
 
@@ -445,7 +464,6 @@ class Overlay(QWidget):
 
         self._poll_timer.stop()
         self._repaint_timer.stop()
-        self._health_timer.stop()
         self._capture_timer.stop()
         self._fatal_window = FatalWindow(
             f"Пайплайн остановлен, приложение закроется.\n\n{msg}",
@@ -537,43 +555,26 @@ class Overlay(QWidget):
             self._plate.fade_in()
 
     def _refresh_indicators(self) -> None:
-        state = self._journal_state()
+        state = self._session.journal_state()
         self._title.disk.set_caption(disk_caption(state))
         color, filled = disk_dot(state)
         self._title.disk.icon_widget().set_dot(color, filled)
-        self._title.disk.setToolTip(self._journal_tooltip(state))
+        self._title.disk.setToolTip(self._session.journal_tooltip(state))
 
-        self._title.llm.set_caption(llm_caption(self._llm_state))
-        color, filled, pulsing = llm_dot(self._llm_state)
+        self._title.llm.set_caption(llm_caption(self._llm_ui.state))
+        color, filled, pulsing = llm_dot(self._llm_ui.state)
         self._title.llm.icon_widget().set_dot(color, filled, pulsing)
-        self._title.llm.setToolTip(llm_tooltip(self._llm_state))
+        self._title.llm.setToolTip(llm_tooltip(self._llm_ui.state))
 
         self._title.capture.icon_widget().set_state(self._capture_state)
         self._title.capture.set_caption(capture_caption(self._capture_state))
         self._title.capture.setToolTip(capture_tooltip(self._capture_state))
         self._title.set_mode(self._mode, force=True)
 
-    def _journal_state(self) -> str:
-        if self._writer is None:
-            return REC_PAUSED
-        if self._writer.failed:
-            return REC_FAILED
-        return REC_ON if self._writer.enabled else REC_PAUSED
-
-    def _journal_tooltip(self, state: str) -> str:
-        if self._writer is None:
-            return "Персист выключен в конфиге: [storage] enabled = false"
-        where = str(self._writer.path) if self._writer.path else "—"
-        if state == REC_FAILED:
-            return "Журнал отключён из-за ошибки записи — подробности в логе"
-        if state == REC_ON:
-            return f"Пишется в {where}\n{describe(self._cfg.hotkeys.toggle_recording)} — пауза"
-        return f"Запись на паузе\n{describe(self._cfg.hotkeys.toggle_recording)} — продолжить"
-
     def _refresh_actions(self) -> None:
         has_words = self._store.size() > 0
-        online = self._llm_state != LLM_OFFLINE
-        model_ready = online and not self._llm_busy
+        online = self._llm_ui.online
+        model_ready = online and not self._llm_ui.busy
         interval = self._cfg.ui.summary_interval_min
 
         answer_ok = model_ready and has_words
@@ -611,31 +612,16 @@ class Overlay(QWidget):
 
     def set_session_meta(self, meta: dict) -> None:
         """Engine/model info for the export header. Any thread (dict swap)."""
-        self._session_meta = dict(meta)
+        self._session._meta = dict(meta)
 
     def set_engine(self, actual: str, model: str, *, requested: str = "") -> None:
-        """Record which ASR engine is really running. Called from the loader.
+        """Which ASR engine really came up. Called from the loader thread."""
+        self._session.set_engine(actual, model, requested=requested)
 
-        Until this existed the session header carried the *configured* engine,
-        written before the model had even tried to load — so after a fallback
-        every exported transcript named an engine that produced none of it. The
-        journal header is corrected too (TranscriptWriter.update_meta), and the
-        session menu grows a line saying what is actually running, because the
-        status message that announced the fallback is gone in seconds.
-        """
-        self._engine_actual = actual
-        self._engine_requested = requested if requested and requested != actual else ""
-        fields = {"engine": actual, "model": model}
-        if self._engine_requested:
-            fields["engine_requested"] = self._engine_requested
-        self._session_meta.update(fields)
-        if self._writer is not None:
-            self._writer.update_meta(**fields)
-
-    def _engine_caption(self) -> str:
-        if self._engine_requested:
-            return f"Движок: {self._engine_actual} (вместо {self._engine_requested})"
-        return f"Движок: {self._engine_actual}"
+    def _on_session_changed(self) -> None:
+        """A resume dropped a previous session into the store."""
+        self._refresh_transcript()
+        self._refresh_actions()
 
     def _on_session_menu(self) -> None:
         menu = QMenu(self)
@@ -649,19 +635,19 @@ class Overlay(QWidget):
         # exists because the fallback used to be announced only by a status
         # message that clears itself, and the app then ran for hours on an
         # engine the user had not chosen.
-        if self._engine_actual:
-            act_engine = menu.addAction(self._engine_caption())
+        if self._session.engine_actual:
+            act_engine = menu.addAction(self._session.engine_caption())
             act_engine.setEnabled(False)
-            if self._engine_requested:
+            if self._session.engine_requested:
                 act_engine.setToolTip(
-                    f"{self._engine_requested} не загрузился — причина в логе"
+                    f"{self._session.engine_requested} не загрузился — причина в логе"
                 )
             menu.addSeparator()
 
         # The journal toggle has to live somewhere clickable: the disk pill is an
         # indicator, not a control, and Alt+R is not guaranteed — Windows may
         # already own the combination.
-        journal = self._journal_state()
+        journal = self._session.journal_state()
         if journal == REC_FAILED:
             act_record = menu.addAction("Запись сорвалась — журнал отключён")
             act_record.setEnabled(False)
@@ -692,12 +678,8 @@ class Overlay(QWidget):
             action.setEnabled(has_words)
 
         menu.addSeparator()
-        last = session_io.latest_session(self._session_dir) if self._session_dir else None
-        current = self._writer.path if self._writer is not None else None
-        # Resuming into a non-empty store would interleave two streams whose
-        # word timestamps both start at zero, so it is offered only on a clean
-        # start — which is also the only moment it is useful.
-        resumable = last is not None and last != current and not has_words
+        last = self._session.latest_session()
+        resumable = self._session.can_resume()
         # Not hidden when unavailable — disabled with the reason (4.5).
         caption = "Загрузить сессию…"
         if not resumable:
@@ -706,7 +688,7 @@ class Overlay(QWidget):
         act_resume = menu.addAction(caption)
         act_resume.setEnabled(resumable)
         act_open = menu.addAction("Открыть папку сессии…")
-        act_open.setEnabled(self._session_dir is not None)
+        act_open.setEnabled(self._session.has_session_dir)
 
         menu.addSeparator()
         act_history = menu.addAction("История выжимок…")
@@ -730,15 +712,15 @@ class Overlay(QWidget):
             else:
                 self.show_source_window()
         elif chosen is act_md:
-            self._export("md")
+            self._session.export("md")
         elif chosen is act_txt:
-            self._export("txt")
+            self._session.export("txt")
         elif chosen is act_copy:
-            self._copy_transcript()
+            self._session.copy_transcript()
         elif chosen is act_resume and last is not None:
-            self._resume_session(last)
+            self._session.resume(last)
         elif chosen is act_open:
-            self._open_session_dir()
+            self._session.open_session_dir()
         elif chosen is act_history:
             self._open_history()
         elif chosen is act_keys:
@@ -758,80 +740,6 @@ class Overlay(QWidget):
         if self._translator.enabled:
             return "Выключить перевод на лету"
         return f"Перевод на лету → {target}"
-
-    def _export(self, suffix: str) -> None:
-        words = self._store.snapshot()
-        if not words:
-            return
-        default_dir = self._session_dir or Path.cwd()
-        source = self._writer.path if self._writer is not None else None
-        suggested = default_dir / session_io.suggest_export_name(
-            self._session_meta, source, suffix
-        )
-        label = "Markdown (*.md)" if suffix == "md" else "Текст (*.txt)"
-        path, _ = QFileDialog.getSaveFileName(
-            self, "Экспорт транскрипта", str(suggested), f"{label};;Все файлы (*)"
-        )
-        if not path:
-            return
-        try:
-            if suffix == "md":
-                session_io.export_markdown(
-                    words, path, self._session_meta,
-                    translations=self._translations.texts_by_index(),
-                )
-            else:
-                # Plain text stays the transcript and nothing else; a bilingual
-                # .txt has no way to say which line is which.
-                session_io.export_text(words, path)
-        except OSError as exc:
-            QMessageBox.warning(self, "Экспорт не удался", f"{path}\n\n{exc}")
-            return
-        self.post_status("Экспорт", f"Экспортировано в {Path(path).name}")
-
-    def _copy_transcript(self) -> None:
-        from PyQt6.QtWidgets import QApplication
-
-        text = " ".join(w.text for w in self._store.snapshot()).strip()
-        if text:
-            QApplication.clipboard().setText(text)
-            self.post_status("Копия", "Транскрипт скопирован в буфер обмена")
-
-    def _resume_session(self, path: Path) -> None:
-        try:
-            meta, entries = session_io.read_session(path)
-        except OSError as exc:
-            QMessageBox.warning(self, "Не удалось прочитать сессию", f"{path}\n\n{exc}")
-            return
-        pairs = [(e.word, e.received_at) for e in entries]
-        loaded = self._store.load_entries(pairs)
-        # Translations come back with the words: re-running the model over a
-        # replayed session would cost minutes and produce the same text. Their
-        # timestamps are recomputed from the words, which is why the entries go
-        # in too.
-        restored = self._translations.load(session_io.read_translations(path), pairs)
-        # The export header keeps *this* session's start time; the origin of the
-        # resumed words is recorded separately.
-        self._session_meta["resumed_from"] = path.name
-        self._refresh_transcript()
-        self._refresh_actions()
-        logger.info(
-            "resumed session %s (%d words, %d translations)", path, loaded, restored
-        )
-        self.post_status(f"{loaded} слов", f"Загружено из {path.name}")
-        _ = meta
-
-    def _open_session_dir(self) -> None:
-        if self._session_dir is None:
-            return
-        try:
-            self._session_dir.mkdir(parents=True, exist_ok=True)
-            # Explorer wants a native path and returns 1 even on success.
-            subprocess.Popen(["explorer", str(self._session_dir)])
-        except OSError as exc:
-            QMessageBox.warning(
-                self, "Не удалось открыть папку", f"{self._session_dir}\n\n{exc}"
-            )
 
     # ------------------------------------------------------------------
     # Satellite windows
@@ -862,15 +770,15 @@ class Overlay(QWidget):
         self._settings_window.activateWindow()
 
     def _on_settings_applied(self, changes: dict) -> None:
-        self._apply_auto_summary()
+        self._llm_ui.apply_auto_summary()
+        self.set_panels_mode(changes.get("panels", self._panels))
         self._hotkeys.rebind(changes.get("hotkeys", {}))
         client = changes.get("llm_client")
         if client is not None:
             # A new provider/key/model takes effect on the next task; re-probe
             # so the title-bar indicator stops showing the old one's state.
             self._llm.set_client(client)
-            self._set_llm_state(LLM_OFFLINE)
-            QTimer.singleShot(0, self._check_lm_availability)
+            self._llm_ui.reset_provider()
         if self._translator is not None and not self._translator.failure:
             self._translator.set_enabled(bool(changes.get("translate_enabled")))
             self._apply_translation_ui()
@@ -918,11 +826,9 @@ class Overlay(QWidget):
     # Actions
     # ------------------------------------------------------------------
 
-    def _on_last_question(self) -> None:
-        question = self._store.find_last_question()
-        if not question:
-            self.post_status("Нет вопроса", "Вопрос в транскрипте не найден")
-            return
+    def _on_question_ready(self, question: str) -> None:
+        """The presenter found the last question — instantly from a '?', or via
+        the model when the engine never emitted one."""
         if not self.isVisible():
             # Triggered by a hotkey with the window hidden: the card has nowhere
             # to appear, so the notification carries the answer (2.6).
@@ -932,162 +838,118 @@ class Overlay(QWidget):
                 icon="question",
             )
             return
-        self._plate.fade_out()
-        self._answer.show_text("Последний вопрос", question)
-
-    def _on_answer(self) -> None:
-        if self._llm_busy:
-            return
-        question = self._store.find_last_question()
-        if not question:
-            self.post_status("Нет вопроса", "Вопрос в транскрипте не найден")
-            return
-        ctx = self._store.context_for_question(question, max_chars=1500)
-        prompt = (
-            "You are given a speech transcript excerpt. "
-            "Answer the question that appears at the end concisely and helpfully. "
-            "Reply in the same language as the question.\n\n"
-            f"Transcript:\n{ctx}\n\nQuestion: {question}"
-        )
-        self._start_llm(prompt, kind="answer")
-
-    def _on_summary(self, *, auto: bool) -> None:
-        if self._llm_busy:
-            return
-        minutes = float(self._cfg.ui.summary_interval_min)
-        words = (
-            self._store.words_since_minutes(minutes) if minutes > 0
-            else self._store.snapshot()
-        )
-        text = " ".join(w.text for w in words).strip()
-        if not text:
-            if not auto:
-                self.post_status("Пусто", "За этот интервал ничего не сказано")
-            return
-        # Keep the most recent text within budget so a long window can't
-        # silently overflow the local model's context (LM Studio would drop
-        # the middle without telling us).
-        truncated = len(text) > self._max_summary_chars
-        if truncated:
-            text = text[-self._max_summary_chars:]
-        span = minutes_caption(int(minutes)) if minutes > 0 else "за всю сессию"
-        prompt = (
-            f"Summarize the following speech transcript ({span}). "
-            "Focus on key points, decisions, and important information. "
-            "Reply in the same language as the transcript.\n\n"
-            + ("[earlier text omitted]\n" if truncated else "")
-            + text
-        )
-        self._start_llm(prompt, kind="summary", minutes=minutes, auto=auto)
-
-    def _apply_auto_summary(self) -> None:
-        interval = self._cfg.ui.summary_interval_min
-        if self._cfg.ui.auto_summary and interval > 0:
-            self._auto_summary_timer.start(interval * 60 * 1000)
-        else:
-            self._auto_summary_timer.stop()
-
-    def _on_auto_summary(self) -> None:
-        self._on_summary(auto=True)
+        if self._panels == PANELS_INLINE:
+            self._plate.fade_out()
+        self._target("question").show_text("Последний вопрос", question)
 
     # ------------------------------------------------------------------
-    # LLM interaction
+    # LLM presentation — the state lives in ui/llm_presenter.py; these are the
+    # widget reactions to it, and nothing else.
     # ------------------------------------------------------------------
 
-    def _start_llm(self, prompt: str, *, kind: str, minutes: float = 0.0, auto: bool = False) -> None:
-        # No availability pre-check here: it would block the UI thread.
-        # The LLM thread checks and reports back through on_error.
-        self._llm_busy = True
-        self._llm_output = ""
-        self._llm_kind = kind
-        self._llm_minutes = minutes
-        self._llm_auto = auto
-        self._set_llm_state(LLM_THINKING)
+    def _target(self, kind: str = ""):
+        """The card or one of the two side windows — whatever the mode says.
+
+        Both have the same surface (`begin`/`set_answer`/`show_text`/`finish`/
+        `fail`/`fade_out`), so every handler below is written once and does not
+        know which one it got. `kind` is the presenter's: only "summary" goes
+        right, everything else — an answer, a found question, a failure — is on
+        the left, because they are one conversation.
+        """
+        if self._panels == PANELS_INLINE:
+            return self._answer
+        if kind == "summary":
+            if self._summary_panel is None:
+                self._summary_panel = summary_panel(self._panels, self)
+            return self._summary_panel
+        if self._answer_panel is None:
+            self._answer_panel = answer_panel(self._panels, self)
+        return self._answer_panel
+
+    def _panel_windows(self) -> list:
+        return [p for p in (self._answer_panel, self._summary_panel) if p is not None]
+
+    def set_panels_mode(self, mode: str) -> None:
+        """Applied live from the settings window."""
+        mode = panel_mode(mode)
+        if mode == self._panels:
+            return
+        self._panels = mode
+        for panel in self._panel_windows():
+            if mode == PANELS_INLINE:
+                panel.hide()
+            else:
+                panel.set_panel_mode(mode)
+                panel.place_beside(force=True)
+
+    def _reposition_panels(self) -> None:
+        for panel in self._panel_windows():
+            if panel.isVisible():
+                panel.place_beside()
+
+    def moveEvent(self, event) -> None:
+        # The side windows are docked to the overlay's edges, so dragging the
+        # overlay takes them along — unless the user has moved one by hand.
+        super().moveEvent(event)
+        self._reposition_panels()
+
+    def _on_llm_state(self, _state: str) -> None:
+        self._refresh_indicators()
         self._refresh_actions()
-        self._plate.fade_out()
-        if not auto or self.isVisible():
-            self._answer.begin("Думаю…")
-        self._llm.submit(
-            LLMTask(
-                type="answer" if kind == "answer" else "summarize",
-                prompt=prompt,
-                on_token=self._llm_token_sig.emit,
-                on_done=self._llm_done_sig.emit,
-                on_error=self._llm_error_sig.emit,
-            )
-        )
 
-    def _on_llm_token(self, token: str) -> None:
-        # Tokens flowing => the server is alive and past thinking.
-        self._set_llm_state(LLM_GENERATING)
-        self._llm_output += token
-        self._answer.set_answer(self._llm_output)
-
-    def _on_llm_done(self) -> None:
-        self._llm_busy = False
-        self._set_llm_state(LLM_ONLINE)
-        self._answer.finish()
-        if self._llm_kind == "summary" and self._llm_output.strip():
-            self._summaries.add(self._llm_output, self._llm_minutes)
-            if self._history_window is not None and self._history_window.isVisible():
-                self._history_window.set_summaries(self._summaries.all())
-            if not self.isVisible() or self._llm_auto:
-                self._announce_summary()
-        elif self._llm_kind == "answer" and not self.isVisible():
-            self._notification.announce(
-                "Ответ готов",
-                f"Клик или {describe(self._cfg.hotkeys.toggle_window)} — открыть",
-                icon="answer",
-            )
+    def _on_llm_started(self, placeholder: str) -> None:
+        if self._panels == PANELS_INLINE:
+            # The card shares its slot with the capture plate; a side window
+            # does not, and an unresolved capture failure must stay visible.
+            self._plate.fade_out()
+        self._target(self._llm_ui.kind).begin(placeholder)
         self._refresh_actions()
 
-    def _on_llm_error(self, msg: str) -> None:
-        self._llm_busy = False
-        # "Офлайн" and "запрос не удался" are different things to know: the
-        # first says start the server, the second says try again.
-        self._set_llm_state(LLM_OFFLINE if "недоступен" in msg else LLM_ERROR)
-        # Keep any tokens already streamed (a mid-stream failure shouldn't wipe
-        # a half-written answer); append the error instead of replacing.
-        if self._llm_output.strip():
-            self._answer.set_answer(f"{self._llm_output}\n\n[ошибка] {msg}")
+    def _on_llm_updated(self, text: str) -> None:
+        self._target(self._llm_ui.kind).set_answer(text)
+
+    def _on_llm_finished(self) -> None:
+        self._target(self._llm_ui.kind).finish()
+        self._refresh_actions()
+
+    def _on_llm_failed(self, text: str, empty: bool) -> None:
+        # `empty` says nothing had streamed yet, so the card shows the failure
+        # on its own instead of appending it to a half-written answer.
+        target = self._target(self._llm_ui.kind)
+        if empty:
+            target.fail(text)
         else:
-            self._answer.fail(msg)
+            target.set_answer(text)
         self._refresh_actions()
 
-    def _announce_summary(self) -> None:
-        self._pending_summary = True
+    def _on_llm_dismissed(self) -> None:
+        """The task produced nothing worth showing — take the surface away.
+
+        Deliberately not through `_target`: that would build a side window in
+        order to hide it.
+        """
+        if self._panels == PANELS_INLINE:
+            self._answer.fade_out()
+            return
+        panel = (
+            self._summary_panel if self._llm_ui.kind == "summary" else self._answer_panel
+        )
+        if panel is not None:
+            panel.fade_out()
+
+    def _on_summary_added(self) -> None:
+        if self._history_window is not None and self._history_window.isVisible():
+            self._history_window.set_summaries(self._summaries.all())
+
+    def _on_llm_notify(self, title: str, hotkey_action: str, icon: str) -> None:
+        """The presenter says what happened; the window knows which key opens it."""
+        combo = getattr(self._cfg.hotkeys, hotkey_action, "")
         self._notification.announce(
-            "Выжимка готова",
-            f"Клик или {describe(self._cfg.hotkeys.history)} — открыть",
+            title, f"Клик или {describe(combo)} — открыть", icon=icon
         )
 
     def _on_notification_clicked(self) -> None:
-        self._pending_summary = False
         self._open_history()
-
-    def _check_lm_availability(self) -> None:
-        # A concurrent health probe mid-generation could flip the indicator on a
-        # transient miss while tokens are clearly flowing; skip it while busy.
-        if self._llm_busy:
-            return
-
-        # models.list() is a network call — keep it off the UI thread.
-        def probe() -> None:
-            self._lm_health_sig.emit(self._llm.is_available())
-
-        threading.Thread(target=probe, name="lm-health", daemon=True).start()
-
-    def _on_lm_health(self, ok: bool) -> None:
-        # The probe only decides between offline and idle-online; it must not
-        # overwrite an in-flight request's state (it is skipped while busy).
-        self._set_llm_state(LLM_ONLINE if ok else LLM_OFFLINE)
-
-    def _set_llm_state(self, state: str) -> None:
-        if state == self._llm_state:
-            return
-        self._llm_state = state
-        self._refresh_indicators()
-        self._refresh_actions()
 
     # ------------------------------------------------------------------
     # Status line (thread-safe entry point for loader threads)
@@ -1108,6 +970,26 @@ class Overlay(QWidget):
         else:
             self._title.status.clear()
 
+    def post_advice(self, message: str, title: str = "Не хватило видеопамяти") -> None:
+        """Surface a "working, but not as configured" state. Any thread.
+
+        Distinct from `post_status`, which is a line that clears itself in
+        seconds: this is for a downgrade the user has to actually know about,
+        such as live translation loading on the CPU because the GPU had no room
+        left beside the ASR model.
+        """
+        self._advice_sig.emit(title, message)
+
+    def _on_advice(self, title: str, message: str) -> None:
+        self._advice_window = AdviceWindow(title, message)
+        geo = self.frameGeometry()
+        self._advice_window.move(
+            geo.center().x() - self._advice_window.width() // 2,
+            max(0, geo.center().y() - self._advice_window.height() // 2),
+        )
+        self._advice_window.show()
+        self._advice_window.raise_()
+
     def post_journal_error(self, message: str) -> None:
         """Transcript journal died (called from the writing thread). Any thread."""
         self._journal_error_sig.emit(message)
@@ -1123,14 +1005,7 @@ class Overlay(QWidget):
     # ------------------------------------------------------------------
 
     def toggle_recording(self) -> None:
-        if self._writer is None or self._writer.failed:
-            self.post_status("Журнал", "Запись на диск недоступна")
-            return
-        if self._writer.enabled:
-            self._writer.pause()
-            self.post_status("Пауза", "Запись транскрипта на паузе")
-        elif self._writer.start():
-            self.post_status("Запись", f"Пишется в {self._writer.path}")
+        self._session.toggle_recording()
         self._refresh_indicators()
 
     # ------------------------------------------------------------------
@@ -1203,10 +1078,7 @@ class Overlay(QWidget):
         self._open_source_window()
 
     def pause_recording(self) -> None:
-        if self._writer is None or not self._writer.enabled:
-            return
-        self._writer.pause()
-        self.post_status("Пауза", "Запись транскрипта на паузе")
+        self._session.pause_recording()
         self._refresh_indicators()
 
     def toggle_visibility(self) -> None:
@@ -1214,9 +1086,13 @@ class Overlay(QWidget):
         if self.isVisible():
             self._fade_window(0.0, hide=True)
             # The source window is part of this window, not a separate app: it
-            # goes away with it and comes back with it.
+            # goes away with it and comes back with it. Same for the two side
+            # panels: hiding the overlay must not leave an answer on screen.
             if self._source_window is not None:
                 self._source_window.hide()
+            self._panels_hidden = [p for p in self._panel_windows() if p.isVisible()]
+            for panel in self._panels_hidden:
+                panel.hide()
         else:
             self.setWindowOpacity(0.0)
             self.show()
@@ -1225,6 +1101,9 @@ class Overlay(QWidget):
             self._notification.dismiss()
             if self.translating():
                 self._apply_translation_ui()
+            for panel in self._panels_hidden:
+                panel.appear()
+            self._panels_hidden = []
 
     def _fade_window(self, target: float, *, hide: bool) -> None:
         self._window_anim = QPropertyAnimation(self, b"windowOpacity", self)
@@ -1247,7 +1126,6 @@ class Overlay(QWidget):
             self.pause_recording()
             return
         if action == "history":
-            self._pending_summary = False
             self._notification.dismiss()
             self._open_history()
             return
@@ -1258,11 +1136,11 @@ class Overlay(QWidget):
         # result announces itself when it is ready (2.6), not when the key is
         # pressed — so nothing extra happens here.
         if action == "summary":
-            self._on_summary(auto=False)
+            self._llm_ui.summarize()
         elif action == "answer":
-            self._on_answer()
+            self._llm_ui.answer()
         elif action == "last_question":
-            self._on_last_question()
+            self._llm_ui.last_question()
 
 
 def hotkey_bindings(hotkeys) -> dict:

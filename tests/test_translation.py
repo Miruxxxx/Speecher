@@ -102,6 +102,24 @@ def test_speech_without_punctuation_or_pauses_still_reaches_the_screen():
     assert [s.n_words for s in segments] == [10, 10]
 
 
+def test_a_blank_entry_does_not_shift_the_indices_after_it():
+    """A segment's index is its first word's absolute position in the store.
+
+    Blank entries are filtered by both TranscriptStore append paths, so this is
+    a latent trap rather than a live bug — but the guard lives in a different
+    module from the code that depends on it. Skipping an entry without counting
+    its position used to shift every later segment by one, and that index is the
+    key the `tr` journal records and TranslationStore.load use to put a
+    translation back onto the words it belongs to.
+    """
+    entries = _entries(("a.", 0.0), ("", 0.4), ("b.", 0.8), ("c.", 1.2))
+    segments = cut(entries, 0, tail_closed=True)
+
+    assert [s.text for s in segments] == ["a.", "b.", "c."]
+    # "b." sits at absolute index 2 — the blank occupies index 1.
+    assert [s.index for s in segments] == [0, 2, 3]
+
+
 def test_indices_are_absolute_and_contiguous():
     """The worker resumes by index; a gap or an overlap would repeat speech."""
     entries = _entries(("a.", 0.0), ("b.", 0.4), ("c.", 0.8))
@@ -261,6 +279,40 @@ def test_backlog_is_merged_not_dropped():
     assert translations.next_index() == 6
 
 
+def test_a_huge_backlog_is_caught_up_in_bounded_steps():
+    """Merging is how the worker catches up, but one merge is not allowed to be
+    the whole backlog.
+
+    Translation is off by default and Alt+T turns it on mid-session, so the
+    store can hold an hour of speech the worker has never seen. Folding all of
+    it into a single Segment hands the model one padded batch of hundreds of
+    sentences — seconds in a single call, and a memory spike proportional to the
+    session, on the GPU the ASR engine is also using. Nothing may be dropped or
+    reordered; it just takes more than one step.
+    """
+    from translate.worker import _MAX_MERGE_SEGMENTS
+
+    store = _store(*[(f"w{i}.", i * 2.0) for i in range(120)])
+    translations = TranslationStore()
+    backend = FakeBackend()
+    worker = _worker(store, translations, backend, max_pending=2)
+
+    worker._step()
+    assert len(backend.calls) == 1
+    first = backend.calls[0][0]
+    assert len(first.split()) == _MAX_MERGE_SEGMENTS      # not all 120
+    assert first.startswith("w0. w1.")
+
+    # Nothing is lost: draining the rest covers every word, in order, once.
+    for _ in range(200):
+        if not worker._step():
+            break
+    assert translations.next_index() == 120
+    assert " ".join(r.text.replace("[ru] ", "") for r in translations.rows()).split() == [
+        f"w{i}." for i in range(120)
+    ]
+
+
 @pytest.mark.parametrize("backend", [FakeBackend(fail=True), FakeBackend(empty=True)])
 def test_a_broken_backend_shows_the_original_instead_of_a_hole(backend):
     store = _store(("Hello.", 0.0))
@@ -311,12 +363,41 @@ def test_disabled_worker_does_not_touch_the_model():
     assert backend.calls == []
 
     worker.set_enabled(True)
+    # What was said while it was off is not retro-translated, so the model is
+    # only reached once something new arrives.
+    store.append([Word(text="World.", start=5.0, end=5.3)])
     deadline = time.time() + 2.0
     while not backend.calls and time.time() < deadline:
         time.sleep(0.02)
     stop.set()
     thread.join(timeout=2.0)
-    assert backend.calls == [("Hello.", "en", "ru")]
+    assert backend.calls == [("World.", "en", "ru")]
+
+
+def test_switching_translation_on_starts_from_what_is_said_next():
+    """The toggle means "translate what I am listening to".
+
+    Translation is off by default and Alt+T flips it mid-session, so the store
+    can hold an hour the worker has never seen. Resuming at the old index filled
+    the feed with an hour of stale subtitles — and, because catch-up merges
+    consecutive waiting segments, it arrived as a few enormous lines instead of
+    subtitles. The speech is not lost: it stays in the transcript, the store,
+    the journal and the export. It is just not translated after the fact.
+    """
+    store = _store(*[(f"old{i}.", i * 2.0) for i in range(30)])
+    translations = TranslationStore()
+    backend = FakeBackend()
+    worker = _worker(store, translations, backend, enabled=False)
+
+    worker.set_enabled(True)
+    assert worker._step() is False          # nothing new yet, backlog skipped
+    assert backend.calls == []
+
+    store.append([Word(text="new.", start=100.0, end=100.4)])
+    assert worker._step() is True
+    assert backend.calls == [("new.", "en", "ru")]
+    # The line lands on its real store position, not renumbered from zero.
+    assert translations.rows()[-1].index == 30
 
 
 # -- journal ----------------------------------------------------------------
@@ -382,3 +463,49 @@ def test_skipped_streak_counts_only_the_newest_run():
     # Anything that is not a pass-through ends the run.
     add(FAILED, 3)
     assert store.skipped_streak() == 0
+
+
+# -- device budget ----------------------------------------------------------
+
+
+def test_a_model_that_does_not_fit_goes_to_the_cpu_with_a_reason():
+    """`torch.cuda.is_available()` answers "is there a GPU", never "is there
+    room on it" — and this app puts two models on one card. A translation model
+    that did not fit used to raise OutOfMemoryError, get caught as "backend
+    failed" and disable the feature with only a log line to explain it."""
+    from utils import vram
+
+    device, reason = vram.choose_device("auto", 1177.0, what="Перевод")
+    assert device in ("cuda", "cpu")
+    if device == "cpu":
+        assert "Перевод" in reason and "CPU" in reason
+    else:
+        assert reason == ""
+
+
+def test_an_explicit_cuda_is_still_checked_for_room(monkeypatch):
+    from utils import vram
+
+    monkeypatch.setattr(vram, "free_mib", lambda: 400.0)
+    device, reason = vram.choose_device("cuda", 1177.0, what="Перевод")
+
+    assert device == "cpu"
+    assert "400" in reason and "CPU" in reason
+
+
+def test_cpu_is_taken_at_face_value(monkeypatch):
+    """Asking for the CPU must not probe the GPU at all."""
+    from utils import vram
+
+    monkeypatch.setattr(vram, "free_mib", lambda: pytest.fail("should not be asked"))
+    assert vram.choose_device("cpu", 99_999.0, what="Перевод") == ("cpu", "")
+
+
+def test_headroom_is_required_not_just_a_bare_fit(monkeypatch):
+    """Weights are not the whole cost: the allocator rounds up and activations
+    land on top, so a load that *just* fits leaves the ASR engine nothing."""
+    from utils import vram
+
+    monkeypatch.setattr(vram, "free_mib", lambda: 1200.0)
+    device, _reason = vram.choose_device("auto", 1177.0, what="Перевод")
+    assert device == "cpu"          # 1177 * 1.25 = 1471 > 1200

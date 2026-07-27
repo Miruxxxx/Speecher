@@ -279,6 +279,32 @@ COMPACT = LayoutMode(
 STATUS_ZONE_W = 180
 STATUS_ZONE_H = 20
 
+# ---------------------------------------------------------------------------
+# 3.1 Where the answer and the summary are shown (section 7.9)
+# ---------------------------------------------------------------------------
+# The in-feed card is capped by `answer_max_h` — 160 px in normal mode — because
+# it overlays the transcript and may not push it around. That cap is right for a
+# card and wrong for an answer somebody reads, so the same content can instead
+# go into two windows beside the overlay: the model's answer and the last
+# question on the left, the summary on the right. They never overlap each other
+# or the overlay, and their size is pinned by the mode rather than by whichever
+# layout the overlay happens to be in.
+PANELS_INLINE = "inline"
+PANELS_SIDE_LARGE = "side_large"
+PANELS_SIDE_COMPACT = "side_compact"
+PANEL_MODES = (PANELS_INLINE, PANELS_SIDE_LARGE, PANELS_SIDE_COMPACT)
+PANEL_SIZES = {
+    PANELS_SIDE_LARGE: (NORMAL.width, NORMAL.height),
+    PANELS_SIDE_COMPACT: (COMPACT.width, COMPACT.height),
+}
+SIDE_GAP = Space.S2       # between a side window and the overlay
+
+
+def panel_mode(value: str) -> str:
+    """Config value -> a mode that exists. A typo in config.toml must not stop
+    the window from opening, so anything unknown reads as the in-feed card."""
+    return value if value in PANEL_MODES else PANELS_INLINE
+
 # Satellite windows
 NOTIFICATION_W, NOTIFICATION_H = 240, 56
 NOTIFICATION_MARGIN = Space.S4     # from the screen edges
@@ -289,7 +315,7 @@ FATAL_W, FATAL_H = 320, 200
 # glanced at, not read.
 SOURCE_W, SOURCE_H = 360, 168
 ONBOARDING_W, ONBOARDING_H = 420, 260
-SETTINGS_W, SETTINGS_H = 420, 470
+SETTINGS_W, SETTINGS_H = 520, 470
 HISTORY_W, HISTORY_H = 380, 460
 MENU_MAX_W = 240
 MENU_ITEM_H = 30

@@ -353,3 +353,50 @@ def test_auth_error_names_the_key():
         body=None,
     )
     assert "ключ" in describe_error(providers.get("groq"), exc)
+
+
+# -- failure classification -------------------------------------------------
+
+
+def test_offline_is_a_flag_not_a_word_in_the_message():
+    """The indicator must not be driven by searching Russian prose.
+
+    `unavailable_message()` only contains "недоступен" when the client has no
+    idea why. Every failure with a known cause reads differently — a dead local
+    server says "сервер не отвечает — запустите его", a bad key says "неверный
+    API-ключ" — so the substring test the overlay used to do reported those as
+    "ошибка" instead of "офлайн".
+    """
+    import openai
+
+    from llm.engine import LLMEngine, LLMFailure, LLMTask
+    from llm.openai_client import describe_error, is_offline
+
+    provider = providers.get("lmstudio")
+    exc = openai.APIConnectionError(request=_httpx_response().request)
+    message = describe_error(provider, exc)
+
+    assert is_offline(exc) is True
+    assert "недоступен" not in message      # the old test would have missed it
+
+    seen: list[LLMFailure] = []
+
+    class DeadClient:
+        provider = providers.get("lmstudio")
+
+        def is_available(self) -> bool:
+            return False
+
+        def unavailable_message(self) -> str:
+            return "LM Studio: сервер не отвечает — запустите его"
+
+    engine = LLMEngine.__new__(LLMEngine)
+    engine._client = DeadClient()
+    engine._process(
+        LLMTask(type="answer", prompt="x", on_token=lambda _t: None,
+                on_done=lambda: None, on_error=seen.append)
+    )
+
+    assert len(seen) == 1
+    assert seen[0].offline is True
+    assert "недоступен" not in seen[0].message
